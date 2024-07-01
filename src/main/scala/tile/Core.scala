@@ -7,6 +7,9 @@ import Chisel._
 import org.chipsalliance.cde.config._
 import freechips.rocketchip.rocket._
 import freechips.rocketchip.util._
+//wzw add smartVector
+import smartVector._
+import smartVector.{RVUissue, RVUCommit}
 
 case object XLen extends Field[Int]
 case object MaxHartIdBits extends Field[Int]
@@ -152,15 +155,6 @@ trait HasCoreParameters extends HasTileParameters {
   // Requires post-processing due to out-of-order writebacks.
   val enableCommitLog = false
 
-  /**
-   * @Editors: wuzewei
-   * @Description: 用来开启trace 方便查看
-   */
-  //usetrace trace总开关
-  val opentrace = true
-  //vtrace 副开关
-  val openvtrace = true
-  val usevtrace = if(opentrace & openvtrace) true else false
 
 }
 
@@ -198,11 +192,15 @@ trait HasCoreIO extends HasTileParameters {
     val cease = Bool().asOutput
     val wfi = Bool().asOutput
     val traceStall = Bool().asInput
-    val decode_interface = new DecodeIO
     /**
      * @Editors: wuzewei
      * @Description: add for verification
      */
-    val verif = coreParams.useVerif.option(new VERIO)
+    val verif = coreParams.useVerif.option(new VEROUTIO)
+    //wzw:add vpu interface
+    val vpu_issue = Decoupled(new RVUissue)
+    val vpu_commit = Flipped(new RVUCommit)
+    val vpu_rfdata = Input(Vec(32, UInt(128.W)))
+    val vpu_memory = Flipped(new RVUMemory)
   }
 }

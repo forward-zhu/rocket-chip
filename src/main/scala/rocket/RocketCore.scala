@@ -11,7 +11,11 @@ import freechips.rocketchip.tile._
 import freechips.rocketchip.util._
 import freechips.rocketchip.util.property
 import freechips.rocketchip.scie._
+
 import scala.collection.mutable.ArrayBuffer
+import Instructions._
+import chisel3.util.experimental.BoringUtils
+
 
 case class RocketCoreParams(
    /**
@@ -226,7 +230,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     Seq(new FenceIDecode(tile.dcache.flushOnFenceI, aluFn)) ++:
     coreParams.haveCFlush.option(new CFlushDecode(tile.dcache.canSupportCFlushLine, aluFn)) ++:
     rocketParams.haveCease.option(new CeaseDecode(aluFn)) ++:
-    Seq(new IDecode(aluFn))
+    Seq(new IDecode(aluFn)) 
   } flatMap(_.table)
 
   val ex_ctrl = Reg(new IntCtrlSigs(aluFn))
@@ -277,12 +281,10 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
    * @Description: 添加mem_reg_rs1信号，方便vset(i)vl(i)在wb阶段进行计算
    */
   val mem_reg_rs1 = Reg(Bits())
-  /**
-   * @Editors: wuzewei
-   * @Description: add for veriification
-   */
-  val mem_reg_verif_mem_addr = coreParams.useVerif.option(Reg(Bits()))
-  val mem_reg_verif_mem_datawr = coreParams.useVerif.option(Reg(Bits()))
+  //zxr:
+  val mem_reg_fp_rs1 = Reg(Bits())
+
+
 
   val mem_br_taken = Reg(Bool())
   val take_pc_mem = Wire(Bool())
@@ -308,13 +310,8 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
    * @Description: 添加wb_reg_rs1信号，方便vset(i)vl(i)在wb阶段进行计算
    */
   val wb_reg_rs1 = Reg(Bits())
-  /**
-   * @Editors: wuzewei
-   * @Description: add for verification
-   */
-  val wb_reg_verif_mem_addr = coreParams.useVerif.option(Reg(Bits()))
-  val wb_reg_verif_mem_datawr = coreParams.useVerif.option(Reg(Bits()))
-  val wb_npc = coreParams.useVerif.option(Reg(Bits()))
+  //zxr:
+  val wb_reg_fp_rs1 = Reg(Bits())
 
   val take_pc_wb = Wire(Bool())
   val wb_reg_wphit           = Reg(Vec(nBreakpoints, Bool()))
@@ -324,6 +321,8 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
 
   // decode stage
   val ibuf = Module(new IBuf)
+  //wzw:add verification unit
+  val ver_module = Module(new UvmVerification)
   val id_expanded_inst = ibuf.io.inst.map(_.bits.inst)
   val id_raw_inst = ibuf.io.inst.map(_.bits.raw)
   val id_inst = id_expanded_inst.map(_.bits)
@@ -334,6 +333,23 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   require(!(coreParams.useRVE && coreParams.fpu.nonEmpty), "Can't select both RVE and floating-point")
   require(!(coreParams.useRVE && coreParams.useHypervisor), "Can't select both RVE and Hypervisor")
   val id_ctrl = Wire(new IntCtrlSigs(aluFn)).decode(id_inst(0), decode_table)
+  //zxr : add for set scoreboard
+  val id_vector_wxd = id_inst(0) === VMV_X_S || id_inst(0) === VCPOP_M || id_inst(0) === VFIRST_M
+ //when(id_vector_wxd) {
+ //  id_ctrl.wxd := true.B
+ //}
+  //zxr: add for set scoreboard of vector instruction
+  val ex_vector_wxd = RegInit(false.B)
+  val mem_vector_wxd = RegInit(false.B)
+  val wb_vector_wxd = RegInit(false.B)
+
+  //zxr:add the set condition of fp_sboard
+  val id_vector_wfd = id_inst(0) === VFMV_F_S
+ //zxr: add for set scoreboard of vector instruction which need to write fp regfile
+  val ex_vector_wfd = RegInit(false.B)
+  val mem_vector_wfd = RegInit(false.B)
+  val wb_vector_wfd = RegInit(false.B)
+  
   val lgNXRegs = if (coreParams.useRVE) 4 else 5
   val regAddrMask = (1 << lgNXRegs) - 1
 
@@ -366,6 +382,14 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     d.io
   }
   val id_illegal_rnum = if (usingCryptoNIST) (id_ctrl.zkn && aluFn.isKs1(id_ctrl.alu_fn) && id_inst(0)(23,20) > 0xA.U(4.W)) else false.B
+  //zxr: add vfp illegal instruction exception
+  val enZvfhmin : Boolean = true
+  val enZvfh : Boolean = true
+  val vfp_illegal_inst = id_inst(0) === VFNCVT_F_F_W && !csr.io.status.isa('d'-'a') && !enZvfhmin.B ||
+                         id_inst(0) === VFNCVT_ROD_F_F_W && !csr.io.status.isa('f'-'a') && !enZvfh.B ||
+                         csr.io.vector.get.vconfig.vtype.vsew === 1.U && !enZvfh.B ||
+                         csr.io.vector.get.vconfig.vtype.vsew === 2.U && !csr.io.status.isa('f'-'a') ||
+                         csr.io.vector.get.vconfig.vtype.vsew === 3.U && !csr.io.status.isa('d'-'a')
   val id_illegal_insn = !id_ctrl.legal ||
     (id_ctrl.mul || id_ctrl.div) && !csr.io.status.isa('m'-'a') ||
     id_ctrl.amo && !csr.io.status.isa('a'-'a') ||
@@ -379,7 +403,11 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     id_ctrl.scie && !(id_scie_decoder.unpipelined || id_scie_decoder.pipelined) ||
     id_csr_en && (csr.io.decode(0).read_illegal || !id_csr_ren && csr.io.decode(0).write_illegal) ||
     !ibuf.io.inst(0).bits.rvc && (id_system_insn && csr.io.decode(0).system_illegal) ||
-    id_illegal_rnum
+    id_illegal_rnum ||
+    vfp_illegal_inst || 
+    id_ctrl.vector && csr.io.decode(0).vector_illegal
+//    ||
+//    id_ctrl.vector && csr.io.vector.get.vstart =/= 0.U
   val id_virtual_insn = id_ctrl.legal &&
     ((id_csr_en && !(!id_csr_ren && csr.io.decode(0).write_illegal) && csr.io.decode(0).virtual_access_illegal) ||
      (!ibuf.io.inst(0).bits.rvc && id_system_insn && csr.io.decode(0).virtual_system_illegal))
@@ -537,8 +565,15 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   ex_reg_xcpt := !ctrl_killd && id_xcpt
   ex_reg_xcpt_interrupt := !take_pc && ibuf.io.inst(0).valid && csr.io.interrupt
 
+   //zxr:
+   //wzw:fix here because fpu and core are in same cycle,so ex_reg_hls is wire type
+  val ex_reg_fp_rs1 = io.fpu.fp_rs1
+
   when (!ctrl_killd) {
     ex_ctrl := id_ctrl
+    //zxr:
+    ex_vector_wxd := id_vector_wxd
+    ex_vector_wfd := id_vector_wfd
     ex_reg_rvc := ibuf.io.inst(0).bits.rvc
     ex_ctrl.csr := id_csr
     ex_scie_unpipelined := id_ctrl.scie && id_scie_decoder.unpipelined
@@ -649,6 +684,9 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     mem_reg_sfence := false.B
   }.elsewhen (ex_pc_valid) {
     mem_ctrl := ex_ctrl
+    //zxr:
+    mem_vector_wxd := ex_vector_wxd
+    mem_vector_wfd := ex_vector_wfd
     mem_scie_unpipelined := ex_scie_unpipelined
     mem_scie_pipelined := ex_scie_pipelined
     mem_reg_rvc := ex_reg_rvc
@@ -666,6 +704,9 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     mem_reg_mem_size := ex_reg_mem_size
     mem_reg_hls_or_dv := io.dmem.req.bits.dv
     mem_reg_pc := ex_reg_pc
+
+    //zxr:
+    mem_reg_fp_rs1 := ex_reg_fp_rs1
     // IDecode ensured they are 1H
     mem_reg_wdata := Mux1H(Seq(
       ex_scie_unpipelined -> ex_scie_unpipelined_wdata,
@@ -677,9 +718,10 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     ))
     mem_br_taken := alu.io.cmp_out
 
-    when (ex_ctrl.rxs2 && (ex_ctrl.mem || ex_ctrl.rocc || ex_sfence)) {
+    when (ex_ctrl.rxs2 && (ex_ctrl.mem || ex_ctrl.rocc || ex_sfence) || ex_ctrl.vector ) {
       val size = Mux(ex_ctrl.rocc, log2Ceil(xLen/8).U, ex_reg_mem_size)
-      mem_reg_rs2 := new StoreGen(size, 0.U, ex_rs(1), coreDataBytes).data
+      //zxr: add for issuing vector instruction in wb stage
+      mem_reg_rs2 := Mux(ex_ctrl.vector,ex_rs(1).asUInt,(new StoreGen(size, 0.U, ex_rs(1), coreDataBytes).data)) 
     }
      /**
      * @Editors: wuzewei
@@ -688,14 +730,6 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     when (ex_ctrl.rxs1) {
       mem_reg_rs1 := ex_rs(0).asUInt
     }
-    /**
-     * @Editors: wuzewei
-     * @Description: add for verification
-     */
-    if(coreParams.useVerif){
-    mem_reg_verif_mem_addr.get := alu.io.adder_out
-    mem_reg_verif_mem_datawr.get := (if (fLen == 0) mem_reg_rs2 else Mux(mem_ctrl.fp, Fill((xLen max fLen) / fLen, io.fpu.store_data), mem_reg_rs2))
-  }
 
     when (ex_ctrl.jalr && csr.io.status.debug) {
       // flush I$ on D-mode JALR to effect uncached fetch without D$ flush
@@ -731,59 +765,42 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
 
   // writeback stage
   //wzw:add for commit stage,Set it to 0 for now and connect to the vpu interface later.
-  val v_decode_ready=WireDefault(true.B)
-  val commit_vld = WireDefault(false.B)
-  val return_data_vld = WireDefault(false.B)
-  val return_data = WireDefault(0.U)
-  val retrun_reg_idx = WireDefault(0.U)
-  val exception_vld = WireDefault(0.B)
-  val illegal_inst = WireDefault(0.B)
+  //TODO:添加commit修改vl逻辑
+
+  val svmqueue = Module(new VpuMessageQueue())
   val update_vl = WireDefault(0.U)
   val update_vstart = WireDefault(0.U)
-  val update_data = WireDefault(0.U)
+  val update_vstart_data = WireDefault(0.U)
   //add exception and pc interface
-  val vpu_pc = WireDefault(0.U)
+  val vpu_pc = WireDefault(svmqueue.io.out.bits.s_v_pc)
   val vpu_mcause = WireDefault(0.U)
-  //
-  //wzw:add for decode stage,Set it to 0 for now and connect to the vpu interface later.
-  val vpu_lsu_req_valid = WireDefault(0.B)
-  val vpu_lsu_req_ld = WireDefault(0.B)
-  val vpu_lsu_req_addrs = WireDefault(0.U)
-  val vpu_lsu_req_data_width = WireDefault(0.U)
-  val vpu_lsu_st_req_data = WireDefault(0.U)
-  val vpu_lsu_waddr = WireDefault(UInt(xLen.W),0.U)
-  //wzw:自己添加，是否进行符号位扩展,可能需要扩展接口
-  val vpu_lsu_signed = WireDefault(0.U)
-  val vpu_rs0 = WireDefault(0.U)
 
 
     wb_reg_valid := !ctrl_killm
-    //TODO:如果正在执行vector指令的话需要停掉replay机制 像是miss之类的情况由vector进行多次发送进行处理 同时注意id阶段要将valid设置为false
+  //TODO:如果正在执行vector指令的话需要停掉replay机制 像是miss之类的情况由vector进行多次发送进行处理 同时注意id阶段要将valid设置为false
   wb_reg_replay := replay_mem && !take_pc_wb
   wb_reg_xcpt := mem_xcpt && !take_pc_wb
   wb_reg_flush_pipe := !ctrl_killm && mem_reg_flush_pipe
   when (mem_pc_valid) {
     wb_ctrl := mem_ctrl
+    //zxr:
+    wb_vector_wxd := mem_vector_wxd
+    wb_vector_wfd := mem_vector_wfd
     wb_reg_sfence := mem_reg_sfence
     wb_reg_wdata := Mux(mem_scie_pipelined, mem_scie_pipelined_wdata,
       Mux(!mem_reg_xcpt && mem_ctrl.fp && mem_ctrl.wxd, io.fpu.toint_data, mem_int_wdata))
-    when (mem_ctrl.rocc || mem_reg_sfence) {
+   //zxr: add for transfering rs2 to wb stage
+    when (mem_ctrl.rocc || mem_reg_sfence || mem_ctrl.vector) {
       wb_reg_rs2 := mem_reg_rs2
     }
     /**
      * @Editors: wuzewei
      * @Description: x[rs1]
      */
-    wb_reg_rs1:=mem_reg_rs1
-    /**
-     * @Editors: wuzewei
-     * @Description: add for verification
-     */
-    if(coreParams.useVerif){
-     wb_reg_verif_mem_addr.get := mem_reg_verif_mem_addr.get
-     wb_reg_verif_mem_datawr.get := mem_reg_verif_mem_datawr.get
-     wb_npc.get := mem_npc
-}
+    wb_reg_rs1 := mem_reg_rs1
+
+    //zxr:
+    wb_reg_fp_rs1 := mem_reg_fp_rs1
 
     wb_reg_cause := mem_cause
     wb_reg_inst := mem_reg_inst
@@ -796,12 +813,30 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     wb_reg_wphit := mem_reg_wphit | bpu.io.bpwatch.map { bpw => (bpw.rvalid(0) && mem_reg_load) || (bpw.wvalid(0) && mem_reg_store) }
 
   }
+  val vpu_lsu_xcpt = io.vpu_commit.commit_vld && io.vpu_commit.exception_vld
 
-  val (wb_xcpt, wb_cause) = checkExceptions(List(
+  val wholeregistorInstructions = Seq(VL1RE8_V, VL1RE16_V, VL1RE32_V, VL1RE64_V, 
+                            VL2RE8_V, VL2RE16_V, VL2RE32_V, VL2RE64_V,
+                            VL4RE8_V, VL4RE16_V, VL4RE32_V, VL4RE64_V,
+                            VL8RE8_V, VL8RE16_V, VL8RE32_V, VL8RE64_V,
+                            VS1R_V, VS2R_V, VS4R_V, VS8R_V)
+  
+  val whole_registor_vld_vst_inst = wholeregistorInstructions.map(wb_reg_inst === _).reduce(_ || _)
+  //val whole_registor_vm_inst = wb_reg_inst ===  VMV1R_V || wb_reg_inst === VMV2R_V || wb_reg_inst === VMV4R_V || wb_reg_inst === VMV8R_V 
+  val wb_illegal_insn = wb_ctrl.vector && !(wb_ctrl.vset || whole_registor_vld_vst_inst) && csr.io.vector.get.vconfig.vtype.vill
+  
+  val (wb_xcpt:Bool, wb_cause) = checkExceptions(List(
     //wzw:若是非法指令的话将wb_cause设置为0x2
-    (commit_vld&&illegal_inst,Causes.illegal_instruction.U),
+    (io.vpu_commit.commit_vld&&io.vpu_commit.illegal_inst,Causes.illegal_instruction.U),
     //wzw:若是访存异常的话，将wb_cause设置为vpu传过来的异常号
-    (commit_vld&&exception_vld,vpu_mcause),
+    (vpu_lsu_xcpt && io.vpu_commit.xcpt_cause.pf.st, Causes.store_page_fault.U),
+    (vpu_lsu_xcpt && io.vpu_commit.xcpt_cause.pf.ld, Causes.load_page_fault.U),
+    (vpu_lsu_xcpt && io.vpu_commit.xcpt_cause.gf.st, Causes.store_guest_page_fault.U),
+    (vpu_lsu_xcpt && io.vpu_commit.xcpt_cause.gf.ld, Causes.load_guest_page_fault.U),
+    (vpu_lsu_xcpt && io.vpu_commit.xcpt_cause.ae.st, Causes.store_access.U),
+    (vpu_lsu_xcpt && io.vpu_commit.xcpt_cause.ae.ld, Causes.load_access.U),
+    (vpu_lsu_xcpt && io.vpu_commit.xcpt_cause.ma.st, Causes.misaligned_store.U),
+    (vpu_lsu_xcpt && io.vpu_commit.xcpt_cause.ma.ld, Causes.misaligned_load.U),
     (wb_reg_xcpt,  wb_reg_cause),
     (wb_reg_valid && wb_ctrl.mem && io.dmem.s2_xcpt.pf.st, Causes.store_page_fault.U),
     (wb_reg_valid && wb_ctrl.mem && io.dmem.s2_xcpt.pf.ld, Causes.load_page_fault.U),
@@ -810,7 +845,10 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     (wb_reg_valid && wb_ctrl.mem && io.dmem.s2_xcpt.ae.st, Causes.store_access.U),
     (wb_reg_valid && wb_ctrl.mem && io.dmem.s2_xcpt.ae.ld, Causes.load_access.U),
     (wb_reg_valid && wb_ctrl.mem && io.dmem.s2_xcpt.ma.st, Causes.misaligned_store.U),
-    (wb_reg_valid && wb_ctrl.mem && io.dmem.s2_xcpt.ma.ld, Causes.misaligned_load.U)
+    (wb_reg_valid && wb_ctrl.mem && io.dmem.s2_xcpt.ma.ld, Causes.misaligned_load.U),
+    //zxr: illegal xcpt
+    (wb_reg_valid && wb_illegal_insn, Causes.illegal_instruction.U)
+    
   ))
    //wzw TODO:需要添加vpu dcache接口信号的传递
 
@@ -827,13 +865,17 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     (Causes.load_guest_page_fault, "LOAD_GUEST_PAGE_FAULT"),
   ) else Nil)
   coverExceptions(wb_xcpt, wb_cause, "WRITEBACK", wbCoverCauses)
-
+ //zxr:
+  val s1_vinst_accessing = RegNext(io.vpu_memory.req.fire,false.B)
+  val s2_vinst_accessing = RegNext(s1_vinst_accessing,false.B)
+  val vinst_accessing = io.vpu_memory.req.fire | s1_vinst_accessing | s2_vinst_accessing  
+  
   val wb_pc_valid = wb_reg_valid || wb_reg_replay || wb_reg_xcpt
   val wb_wxd = wb_reg_valid && wb_ctrl.wxd
   val wb_set_sboard = wb_ctrl.div || wb_dcache_miss || wb_ctrl.rocc
     //wzw 防止vpu产生的写后读问题
-  val id_set_sboard = id_ctrl.vector
-  val replay_wb_common = io.dmem.s2_nack || wb_reg_replay
+  //val id_set_sboard = id_ctrl.vector
+  val replay_wb_common = (io.dmem.s2_nack && !vinst_accessing )|| wb_reg_replay
   val replay_wb_rocc = wb_reg_valid && wb_ctrl.rocc && !io.rocc.cmd.ready
   val replay_wb = replay_wb_common || replay_wb_rocc
   take_pc_wb := replay_wb || wb_xcpt || csr.io.eret || wb_reg_flush_pipe
@@ -869,40 +911,65 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     val symbol=Fill(xLen-1-5,0.U)
     wb_avl := Cat(symbol,wb_uimm)
   }
-  val issue_vconfig = Wire(new VConfig)
+  val vset_issue_vconfig = Wire(new VConfig)
+  val vpu_issue_vconfig = Wire(new VConfig)
+  vpu_issue_vconfig.vtype := VType.fromUInt(csr.io.vector.get.vconfig.vtype.asUInt,false)
+  vpu_issue_vconfig.vl := io.vpu_commit.update_vl_data
   // val issue_vstart = Wire(UInt(maxVLMax.log2.W))
   // val issue_vxsat = Wire(Bool())
   val zeroSignal=0.U(((xLen)-8).W)
   val zimm=Cat(zeroSignal,wb_reg_wdata(7,0))
-  issue_vconfig.vtype := VType.fromUInt(zimm,false)
-  issue_vconfig.vl := VType.computeVL(wb_avl,zimm,csr.io.vector.get.vconfig.vl,wb_usecurrent,wb_usemax,wb_usezero)
+  vset_issue_vconfig.vtype := VType.fromUInt(zimm,false)
+  vset_issue_vconfig.vl := VType.computeVL(wb_avl,zimm,csr.io.vector.get.vconfig.vl,wb_usecurrent,wb_usemax,wb_usezero)
   csr.io.vector.foreach { vio =>
-    vio.set_vconfig.bits := issue_vconfig   
-    vio.set_vconfig.valid := (wb_valid & wb_ctrl.vset)
-    //wzw:change for updating vstart
-    vio.set_vstart.valid := (commit_vld & update_vl)
-    vio.set_vstart.bits := update_data
-    vio.set_vxsat := 0.U
+    vio.set_vconfig.bits := Mux((wb_valid & wb_ctrl.vset),vset_issue_vconfig,vpu_issue_vconfig)
+    vio.set_vconfig.valid := (wb_valid & wb_ctrl.vset) | (io.vpu_commit.commit_vld & io.vpu_commit.update_vl)
+    //wzw:change for updating vstart All vector instructions, including vset{i}vl{i}, reset the vstart CSR to zero
+    vio.set_vstart.valid := ((io.vpu_commit.commit_vld)&(update_vstart))|(wb_valid & wb_ctrl.vset)
+    vio.set_vstart.bits := Mux((wb_valid & wb_ctrl.vset),0.U,update_vstart_data)
+    vio.set_vxsat := io.vpu_commit.vxsat
     vio.set_vs_dirty := (wb_valid &(wb_ctrl.vset|wb_ctrl.vector))
     //vio.set_vs_dirty := false.asBool
     }
 
-  //加decode接口，jyf
-  dontTouch(io.decode_interface)
-  io.decode_interface.instr := id_inst(0)   
-  io.decode_interface.rs1 := ex_rs(0)
-  io.decode_interface.rs2 := ex_rs(1)
-  io.decode_interface.valid := !ctrl_killd && id_ctrl.vector
-  io.decode_interface.vl := csr.io.vector.get.vconfig.vl
-  io.decode_interface.vstart := csr.io.vector.get.vstart
-  io.decode_interface.vma := csr.io.vector.get.vconfig.vtype.vma
-  io.decode_interface.vta := csr.io.vector.get.vconfig.vtype.vta
-  io.decode_interface.vsew := csr.io.vector.get.vconfig.vtype.vsew
-  io.decode_interface.vlmul := csr.io.vector.get.vconfig.vtype.vlmul_signed.asUInt
-  //
-  io.decode_interface.id_resp_data := io.dmem.resp.bits.data(xLen-1,0)
-  io.decode_interface.lsu_resp_valid := io.dmem.resp.valid
-  io.decode_interface.lsu_resp_excp := io.dmem.s2_xcpt.pf.st||io.dmem.s2_xcpt.pf.ld
+
+//zxr: issue queue
+val vectorQueue = Module(new InsructionQueue(12))
+
+vectorQueue.io.enqueueInfo.valid := wb_reg_valid && wb_ctrl.vector && !(wb_xcpt);
+vectorQueue.io.enqueueInfo.bits.v_rs1 := wb_reg_rs1
+vectorQueue.io.enqueueInfo.bits.v_rs2 := wb_reg_rs2
+vectorQueue.io.enqueueInfo.bits.v_fp_rs1 := wb_reg_fp_rs1
+vectorQueue.io.enqueueInfo.bits.v_inst := wb_reg_inst
+vectorQueue.io.dequeueInfo.ready := io.vpu_issue.ready
+
+  //wzw: save message
+  svmqueue.io.in.valid := wb_reg_valid && wb_ctrl.vector && !(wb_xcpt);
+  svmqueue.io.in.bits.s_v_pc := wb_reg_pc
+  svmqueue.io.out.ready := io.vpu_commit.commit_vld
+
+  //zxr: issue vector instructions during the WB stage
+
+  io.vpu_issue.valid := vectorQueue.io.dequeueInfo.valid 
+  io.vpu_issue.bits.inst := vectorQueue.io.dequeueInfo.bits.v_inst
+  io.vpu_issue.bits.rs1 := vectorQueue.io.dequeueInfo.bits.v_rs1
+  io.vpu_issue.bits.rs2 := vectorQueue.io.dequeueInfo.bits.v_rs2
+  io.vpu_issue.bits.frs1 := vectorQueue.io.dequeueInfo.bits.v_fp_rs1
+
+  io.vpu_issue.bits.vInfo.vl := csr.io.vector.get.vconfig.vl
+  io.vpu_issue.bits.vInfo.vstart := csr.io.vector.get.vstart
+  io.vpu_issue.bits.vInfo.vma := csr.io.vector.get.vconfig.vtype.vma
+  io.vpu_issue.bits.vInfo.vta := csr.io.vector.get.vconfig.vtype.vta
+  io.vpu_issue.bits.vInfo.vsew := csr.io.vector.get.vconfig.vtype.vsew
+  io.vpu_issue.bits.vInfo.vlmul := Cat(csr.io.vector.get.vconfig.vtype.vlmul_sign,csr.io.vector.get.vconfig.vtype.vlmul_mag)
+  io.vpu_issue.bits.vInfo.vxrm := csr.io.vector.get.vxrm
+  io.vpu_issue.bits.vInfo.frm := csr.io.fcsr_rm
+  dontTouch(io.vpu_issue);
+  dontTouch(io.vpu_commit);
+  dontTouch(io.vpu_memory);
+  //io.decode_interface.id_resp_data := io.dmem.resp.bits.data(xLen-1,0)
+  //io.decode_interface.lsu_resp_valid := io.dmem.resp.valid
+  //io.decode_interface.lsu_resp_excp := io.dmem.s2_xcpt.pf.st||io.dmem.s2_xcpt.pf.ld
 
 
 
@@ -917,10 +984,15 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   }
   //wzw:写回阶段的接口
   if(usingVector){
-    when(commit_vld){
-      ll_wdata := return_data
-      ll_wen := return_data_vld
-      ll_waddr := retrun_reg_idx
+    when(io.vpu_commit.commit_vld){
+      //TODO:需要有类似的添加,否则会有错误
+      //io.vpu.resp.ready := !wb_wxd
+      div.io.resp.ready := false.B
+      if (usingRoCC)
+       io.rocc.resp.ready := false.B
+      ll_wdata := io.vpu_commit.return_data
+      ll_wen := io.vpu_commit.return_data_vld & io.vpu_commit.commit_vld
+      ll_waddr := io.vpu_commit.return_reg_idx
     }
   }
   when (dmem_resp_replay && dmem_resp_xpu) {
@@ -933,7 +1005,8 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
 
   val wb_wen = wb_valid && wb_ctrl.wxd
   //wzw 防止vpu可能产生的写后读问题
-  val id_wen = (!ctrl_killd) & wb_ctrl.wxd
+
+  //val id_wen = (!ctrl_killd) & id_ctrl.wxd
   val rf_wen = wb_wen || ll_wen
   val rf_waddr = Mux(ll_wen, ll_waddr, wb_waddr)
   val rf_wdata = Mux(dmem_resp_valid && dmem_resp_xpu, io.dmem.resp.bits.data(xLen-1, 0),
@@ -941,7 +1014,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
                   * @Editors: wuzewei
                   * @Description: 若是vset(i)vl(i)信号，则写回的是从csr返回的vl的值
                   */
-                 Mux(wb_ctrl.vset,issue_vconfig.vl,
+                 Mux(wb_ctrl.vset,vset_issue_vconfig.vl,
                  Mux(ll_wen, ll_wdata,
                  Mux(wb_ctrl.csr =/= CSR.N, csr.io.rw.rdata,
                  Mux(wb_ctrl.mul, mul.map(_.io.resp.bits.data).getOrElse(wb_reg_wdata),
@@ -953,17 +1026,24 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   csr.io.decode(0).inst := id_inst(0)
   csr.io.exception := wb_xcpt
   csr.io.cause := wb_cause
-  csr.io.retire := wb_valid
+  //zxr: change retire signal for vpu
+  csr.io.retire := !wb_ctrl.vector && wb_valid ||  io.vpu_commit.commit_vld && !io.vpu_commit.exception_vld
   csr.io.inst(0) := (if (usingCompressed) Cat(Mux(wb_reg_raw_inst(1, 0).andR, wb_reg_inst >> 16, 0.U), wb_reg_raw_inst(15, 0)) else wb_reg_inst)
   csr.io.interrupts := io.interrupts
   csr.io.hartid := io.hartid
   io.fpu.fcsr_rm := csr.io.fcsr_rm
+  //add vpu fflags process
+  when(!io.vpu_commit.commit_vld){
   csr.io.fcsr_flags := io.fpu.fcsr_flags
+  }.otherwise{
+  csr.io.fcsr_flags.valid := true.B
+  csr.io.fcsr_flags.bits := io.vpu_commit.fflags
+  }
   io.fpu.time := csr.io.time(31,0)
   io.fpu.hartid := io.hartid
   csr.io.rocc_interrupt := io.rocc.interrupt
-  //wzw：当vpu返回的值有效时，此时的pc是vpu传过来的pc
-  when(commit_vld){
+  //wzw：当vpu返回的值有效时，此时的pc是vpu传过来的pc 用于更新mepc
+  when(io.vpu_commit.commit_vld){
     csr.io.pc := vpu_pc
   }.otherwise{
     csr.io.pc := wb_reg_pc
@@ -974,7 +1054,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val tval_inst = wb_reg_cause === Causes.illegal_instruction.U
   val tval_valid = wb_xcpt && (tval_any_addr || tval_inst)
   csr.io.gva := wb_xcpt && (tval_any_addr && csr.io.status.v || tval_dmem_addr && wb_reg_hls_or_dv)
-  csr.io.tval := Mux(tval_valid, encodeVirtualAddress(wb_reg_wdata, wb_reg_wdata), 0.U)
+  csr.io.tval := Mux(vpu_lsu_xcpt, encodeVirtualAddress(io.vpu_commit.xcpt_addr,io.vpu_commit.xcpt_addr), Mux(tval_valid, encodeVirtualAddress(wb_reg_wdata, wb_reg_wdata), 0.U))
   csr.io.htval := {
     val htval_valid_imem = wb_reg_xcpt && wb_reg_cause === Causes.fetch_guest_page_fault.U
     val htval_imem = Mux(htval_valid_imem, io.imem.gpa.bits, 0.U)
@@ -1018,13 +1098,13 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     iobpw.action := bp.control.action
   }
 
-  val hazard_targets = Seq((id_ctrl.rxs1 && id_raddr1 =/= 0.U, id_raddr1),
-                           (id_ctrl.rxs2 && id_raddr2 =/= 0.U, id_raddr2),
-                           (id_ctrl.wxd  && id_waddr  =/= 0.U, id_waddr))
-  val fp_hazard_targets = Seq((io.fpu.dec.ren1, id_raddr1),
+  val hazard_targets = Seq(((id_ctrl.rxs1 || id_ctrl.vector) && id_raddr1 =/= 0.U, id_raddr1), 
+                           (id_ctrl.rxs2 && id_raddr2 =/= 0.U, id_raddr2),  
+                           ((id_ctrl.wxd || id_vector_wxd)  && id_waddr  =/= 0.U, id_waddr))  //zxr: add for vector inst which need to write to the integer register
+  val fp_hazard_targets = Seq((io.fpu.dec.ren1 || id_ctrl.vector, id_raddr1),   //zxr: add for vector inst
                               (io.fpu.dec.ren2, id_raddr2),
                               (io.fpu.dec.ren3, id_raddr3),
-                              (io.fpu.dec.wen, id_waddr))
+                              (io.fpu.dec.wen || id_vector_wfd, id_waddr))  
 
   val sboard = new Scoreboard(32, true)
   sboard.clear(ll_wen, ll_waddr)
@@ -1036,35 +1116,47 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val id_sboard_hazard = checkHazards(hazard_targets, rd => sboard.read(rd) && !id_sboard_clear_bypass(rd))
   //wzw: 添加vpu设置scoreboard支持
   // TODO:译码部分加入对id_wen的译码
-  val sboard_waddr =Mux((id_set_sboard & id_wen), id_waddr,wb_waddr)
-  sboard.set((wb_set_sboard && wb_wen)||(id_set_sboard & id_wen), sboard_waddr)
+  //zxr: change from id stage to wb stage
+ // val sboard_waddr =Mux(id_vector_wxd, id_waddr,wb_waddr)
+  val sboard_waddr =wb_waddr
+  sboard.set((wb_set_sboard && wb_wen)||(wb_vector_wxd && wb_reg_valid && (!wb_xcpt)), sboard_waddr)
 
   // stall for RAW/WAW hazards on CSRs, loads, AMOs, and mul/div in execute stage.
-  val ex_cannot_bypass = ex_ctrl.csr =/= CSR.N || ex_ctrl.jalr || ex_ctrl.mem || ex_ctrl.mul || ex_ctrl.div || ex_ctrl.fp || ex_ctrl.rocc || ex_scie_pipelined
-  val data_hazard_ex = ex_ctrl.wxd && checkHazards(hazard_targets, _ === ex_waddr)
-  val fp_data_hazard_ex = id_ctrl.fp && ex_ctrl.wfd && checkHazards(fp_hazard_targets, _ === ex_waddr)
-  val id_ex_hazard = ex_reg_valid && (data_hazard_ex && ex_cannot_bypass || fp_data_hazard_ex)
+  // wzw:vset can't bypass until the wb stage
+  val ex_cannot_bypass = ex_ctrl.csr =/= CSR.N || ex_ctrl.jalr || ex_ctrl.mem || ex_ctrl.mul || ex_ctrl.div || ex_ctrl.fp || ex_ctrl.rocc || ex_scie_pipelined ||ex_ctrl.vset || ex_ctrl.vector  //zxr: vector instructions cannot bypass
+  val data_hazard_ex = (ex_ctrl.wxd || ex_vector_wxd ) && checkHazards(hazard_targets, _ === ex_waddr)  //zxr: some of the vector instructions may need to write to the integer register
+  // zxr: add for vector inst read fp regfile 
+  val fp_data_hazard_ex = id_ctrl.fp && ex_ctrl.wfd && checkHazards(fp_hazard_targets, _ === ex_waddr) || id_ctrl.vector && (ex_ctrl.wfd || ex_vector_wfd) && checkHazards(fp_hazard_targets, _ === ex_waddr)
+  val id_ex_hazard = ex_reg_valid && (data_hazard_ex && ex_cannot_bypass || fp_data_hazard_ex)  
 
   // stall for RAW/WAW hazards on CSRs, LB/LH, and mul/div in memory stage.
   val mem_mem_cmd_bh =
     if (fastLoadWord) (!fastLoadByte).B && mem_reg_slow_bypass
     else true.B
-  val mem_cannot_bypass = mem_ctrl.csr =/= CSR.N || mem_ctrl.mem && mem_mem_cmd_bh || mem_ctrl.mul || mem_ctrl.div || mem_ctrl.fp || mem_ctrl.rocc
-  val data_hazard_mem = mem_ctrl.wxd && checkHazards(hazard_targets, _ === mem_waddr)
-  val fp_data_hazard_mem = id_ctrl.fp && mem_ctrl.wfd && checkHazards(fp_hazard_targets, _ === mem_waddr)
+  // wzw:vset can't bypass until the wb stage
+  val mem_cannot_bypass = mem_ctrl.csr =/= CSR.N || mem_ctrl.mem && mem_mem_cmd_bh || mem_ctrl.mul || mem_ctrl.div || mem_ctrl.fp || mem_ctrl.rocc || mem_ctrl.vset || mem_ctrl.vector   //zxr: vector instructions cannot bypass
+  val data_hazard_mem = (mem_ctrl.wxd || mem_vector_wxd ) && checkHazards(hazard_targets, _ === mem_waddr)
+  val fp_data_hazard_mem = id_ctrl.fp && mem_ctrl.wfd && checkHazards(fp_hazard_targets, _ === mem_waddr) || id_ctrl.vector && (mem_ctrl.wfd || mem_vector_wfd) && checkHazards(fp_hazard_targets, _ === mem_waddr)
   val id_mem_hazard = mem_reg_valid && (data_hazard_mem && mem_cannot_bypass || fp_data_hazard_mem)
   id_load_use := mem_reg_valid && data_hazard_mem && mem_ctrl.mem
 
   // stall for RAW/WAW hazards on load/AMO misses and mul/div in writeback.
   val data_hazard_wb = wb_ctrl.wxd && checkHazards(hazard_targets, _ === wb_waddr)
-  val fp_data_hazard_wb = id_ctrl.fp && wb_ctrl.wfd && checkHazards(fp_hazard_targets, _ === wb_waddr)
-  val id_wb_hazard = wb_reg_valid && (data_hazard_wb && wb_set_sboard || fp_data_hazard_wb)
+  val data_hazard_wb_vector = wb_vector_wxd && checkHazards(hazard_targets, _ === wb_waddr) // stall for RAW/WAW hazards on vector in WB 
+  val fp_data_hazard_wb = id_ctrl.fp && wb_ctrl.wfd && checkHazards(fp_hazard_targets, _ === wb_waddr) || id_ctrl.vector && (wb_ctrl.wfd || wb_vector_wfd) && checkHazards(fp_hazard_targets, _ === wb_waddr)
+  val id_wb_hazard = wb_reg_valid && (data_hazard_wb && wb_set_sboard || fp_data_hazard_wb || data_hazard_wb_vector)  
 
+
+  //wzw:add vpu_w_fpr to clear sboard
+  val vpu_w_fpr=   (io.vpu_commit.commit_vld & io.vpu_commit.return_data_float_vld &(!io.vpu_commit.exception_vld))
+  val vpu_w_fpr_e= (io.vpu_commit.return_data_float_vld & io.vpu_commit.exception_vld)
   val id_stall_fpu = if (usingFPU) {
     val fp_sboard = new Scoreboard(32)
-    fp_sboard.set((wb_dcache_miss && wb_ctrl.wfd || io.fpu.sboard_set) && wb_valid, wb_waddr)
+    fp_sboard.set((wb_dcache_miss && wb_ctrl.wfd || io.fpu.sboard_set) && wb_valid || wb_vector_wfd && wb_reg_valid && (!wb_xcpt), wb_waddr)
     fp_sboard.clear(dmem_resp_replay && dmem_resp_fpu, dmem_resp_waddr)
     fp_sboard.clear(io.fpu.sboard_clr, io.fpu.sboard_clra)
+    //wzw: fp clear sboard
+    fp_sboard.clear(vpu_w_fpr.asBool||vpu_w_fpr_e.asBool,io.vpu_commit.return_reg_idx)
 
     checkHazards(fp_hazard_targets, fp_sboard.read _)
   } else false.B
@@ -1081,21 +1173,35 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   //if vpu busy, satll rocket，jyf
   //not ready，要stall住标量和向量的发送，故ctrl_stalld置1，并导致ctrl_killd置1
   //isvectorrun,有向量指令在执行，但如果下一条仍是向量且ready仍能发
+  //wzw 如果发送到队列中则认为指令已经发出去了
   val table = RegInit(0.U(4.W))
-  when(io.decode_interface.valid&v_decode_ready) {table := table + 1.U}
-  when(commit_vld) {table := table - 1.U}
-  val isvectorrun = table =/= 0.U
+  when(vectorQueue.io.enqueueInfo.valid&io.vpu_commit.commit_vld){
+    table := table;
+  }.elsewhen(vectorQueue.io.enqueueInfo.valid) {table := table + 1.U}
+  .elsewhen(io.vpu_commit.commit_vld) {table := table - 1.U}
+  val isvectorrun = ((table===0.U) && io.vpu_issue.fire)||(table =/= 0.U)
+
+  //zxr: check if there are any vector instructions in the pipeline
+  //**
+  val vector_in_pipe = (ex_reg_valid && ex_ctrl.vector) || (mem_reg_valid && mem_ctrl.vector) ||(wb_reg_valid && wb_ctrl.vector)
+  //**
 
   val ctrl_stalld = {
-    //jyf:add stall logic
-    (id_ctrl.vector&&(!v_decode_ready))||(isvectorrun && !id_ctrl.vector)||
     id_ex_hazard || id_mem_hazard || id_wb_hazard || id_sboard_hazard ||
     csr.io.singleStep && (ex_reg_valid || mem_reg_valid || wb_reg_valid) ||
     id_csr_en && csr.io.decode(0).fp_csr && !io.fpu.fcsr_rdy ||
-    id_ctrl.fp && id_stall_fpu ||
+    (id_ctrl.fp || id_ctrl.vector) && id_stall_fpu ||   //zxr:add vector instruction check harzard condition
     id_ctrl.mem && dcache_blocked || // reduce activity during D$ misses
     id_ctrl.rocc && rocc_blocked || // reduce activity while RoCC is busy
     id_ctrl.div && (!(div.io.req.ready || (div.io.resp.valid && !wb_wxd)) || div.io.req.valid) || // reduce odds of replay
+    //wzw:change stall logic,because rocket will issue in ex stage
+   (isvectorrun && !id_ctrl.vector)||
+   //zxr : prevent scalar instruction from entering pipeline until the vector instructions are processed completely
+   //**
+   (!id_ctrl.vector && vector_in_pipe) ||
+      (ex_vector_wxd&&ex_reg_valid) || (mem_vector_wxd&&mem_reg_valid) || (wb_vector_wxd && wb_reg_valid) ||
+       (ex_vector_wfd && ex_reg_valid) || (mem_vector_wfd && mem_reg_valid) || (wb_vector_wfd && wb_reg_valid) ||
+    //**
     !clock_en ||
     id_do_fence ||
     csr.io.csr_stall ||
@@ -1112,7 +1218,8 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
                                 mem_npc))    // flush or branch misprediction
   io.imem.flush_icache := wb_reg_valid && wb_ctrl.fence_i && !io.dmem.s2_nack
   io.imem.might_request := {
-    imem_might_request_reg := ex_pc_valid || mem_pc_valid || io.ptw.customCSRs.disableICacheClockGate
+    //wzw:when ex_pc_valid and mem_pc_valid is false vector instruction might request
+    imem_might_request_reg := ex_pc_valid || mem_pc_valid || io.ptw.customCSRs.disableICacheClockGate || isvectorrun || !isvectorrun && io.vpu_commit.exception_vld
     imem_might_request_reg
   }
   io.imem.progress := RegNext(wb_reg_valid && !replay_wb_common)
@@ -1146,46 +1253,83 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   io.imem.bht_update.bits.branch := mem_ctrl.branch
   io.imem.bht_update.bits.prediction := mem_reg_btb_resp.bht
 
-  io.fpu.valid := !ctrl_killd && id_ctrl.fp
+  io.fpu.valid := !ctrl_killd && id_ctrl.fp || id_ctrl.vector // allow vector instruction
   io.fpu.killx := ctrl_killx
   io.fpu.killm := killm_common
   io.fpu.inst := id_inst(0)
   io.fpu.fromint_data := ex_rs(0)
-  io.fpu.dmem_resp_val := dmem_resp_valid && dmem_resp_fpu
-  io.fpu.dmem_resp_data := (if (minFLen == 32) io.dmem.resp.bits.data_word_bypass else io.dmem.resp.bits.data)
-  io.fpu.dmem_resp_type := io.dmem.resp.bits.size
-  io.fpu.dmem_resp_tag := dmem_resp_waddr
+  //wzw:use this interface to write fpr
+  io.fpu.dmem_resp_val := (dmem_resp_valid && dmem_resp_fpu) || vpu_w_fpr
+  io.fpu.dmem_resp_data := Mux(vpu_w_fpr,io.vpu_commit.return_data,(if (minFLen == 32) io.dmem.resp.bits.data_word_bypass else io.dmem.resp.bits.data))
+  io.fpu.dmem_resp_type := Mux(vpu_w_fpr,3.asUInt,io.dmem.resp.bits.size)
+  io.fpu.dmem_resp_tag := Mux(vpu_w_fpr,io.vpu_commit.return_reg_idx,dmem_resp_waddr)
   io.fpu.keep_clock_enabled := io.ptw.customCSRs.disableCoreClockGate
+  //zxr:
+  io.fpu.id_ctrl_vector := id_ctrl.vector
 
-  //wzw:添加dmem访问条件
-  io.dmem.req.valid     := (ex_reg_valid && ex_ctrl.mem)|(vpu_lsu_req_valid)
+//添加dmem访存条件
+  io.dmem.req.valid     := (ex_reg_valid && ex_ctrl.mem)|(io.vpu_memory.req.valid)
+  io.vpu_memory.req.ready := io.dmem.req.ready
+
   val ex_dcache_tag = Cat(ex_waddr, ex_ctrl.fp)
   //wzw:添加vpu_dcache_tag
-  val vpu_dcache_tag = Cat(vpu_lsu_waddr, 0.B)
+  val vpu_dcache_tag = Cat(io.vpu_memory.req.bits.addr, 0.B)
   require(coreParams.dcacheReqTagBits >= ex_dcache_tag.getWidth)
   //require(coreParams.dcacheReqTagBits >= vpu_dcache_tag.getWidth)
   //wzw:tag 用来传递waddr信息，在此更改条件,添加vpu访存信息。
-  io.dmem.req.bits.tag  := Mux(vpu_lsu_req_valid,vpu_dcache_tag,ex_dcache_tag)
-  //wzw:添加vpu_mem_cmd
-  val vpu_mem_cmd = Mux(vpu_lsu_req_ld,M_XWR,M_XRD)
-  io.dmem.req.bits.cmd  := Mux(vpu_lsu_req_valid,vpu_mem_cmd,ex_ctrl.mem_cmd)
-  //wzw:ex_reg_mem_size代表写的大小
-  io.dmem.req.bits.size := Mux(vpu_lsu_req_valid,vpu_lsu_req_data_width,ex_reg_mem_size)
+  io.dmem.req.bits.tag  := Mux(io.vpu_memory.req.valid,vpu_dcache_tag,ex_dcache_tag)
+  //zxr:add the cmd for request of vpu
+  val vpu_memory_cmd = Mux(io.vpu_memory.req.bits.cmd,M_PWR,M_XRD)
+  io.dmem.req.bits.cmd  := Mux(io.vpu_memory.req.valid,vpu_memory_cmd,ex_ctrl.mem_cmd)
+  //zxr:add for the size of v inst
+  io.dmem.req.bits.size := Mux(io.vpu_memory.req.valid,3.U,ex_reg_mem_size)
   //signed代表是否扩展符号
-  io.dmem.req.bits.signed := Mux(vpu_lsu_req_valid,vpu_lsu_signed,!Mux(ex_reg_hls, ex_reg_inst(20), ex_reg_inst(14)))
+ // io.dmem.req.bits.signed := Mux(vpu_lsu_req_valid,vpu_lsu_signed,!Mux(ex_reg_hls, ex_reg_inst(20), ex_reg_inst(14)))
+ 
+  io.dmem.req.bits.signed :=Mux(io.vpu_memory.req.valid,false.B,!Mux(ex_reg_hls, ex_reg_inst(20), ex_reg_inst(14)))
   io.dmem.req.bits.phys := false.B
-  io.dmem.req.bits.addr := Mux(vpu_lsu_req_valid,encodeVirtualAddress(vpu_rs0, vpu_lsu_waddr),encodeVirtualAddress(ex_rs(0), alu.io.adder_out))
-  io.dmem.req.bits.idx.foreach(_ := io.dmem.req.bits.addr)
-  io.dmem.req.bits.dprv := Mux(vpu_lsu_req_valid,csr.io.status.dprv,Mux(ex_reg_hls, csr.io.hstatus.spvp, csr.io.status.dprv))
-  io.dmem.req.bits.dv := Mux(vpu_lsu_req_valid,csr.io.status.dv,ex_reg_hls || csr.io.status.dv)
-  //vpu传过来的数据需要延迟一拍 传入dcache
-  val vpu_lsu_st_req_data_delay = RegEnable(vpu_lsu_st_req_data,0.U,vpu_lsu_req_valid)
-  io.dmem.s1_data.data := Mux(vpu_lsu_req_valid,vpu_lsu_st_req_data_delay ,(if (fLen == 0) mem_reg_rs2 else Mux(mem_ctrl.fp, Fill((xLen max fLen) / fLen, io.fpu.store_data), mem_reg_rs2)))
+
+  io.dmem.req.bits.addr := Mux(io.vpu_memory.req.valid,encodeVirtualAddress(io.vpu_memory.req.bits.addr, io.vpu_memory.req.bits.addr),encodeVirtualAddress(ex_rs(0), alu.io.adder_out))
+ 
+  io.dmem.req.bits.idx.foreach(_ := io.dmem.req.bits.addr)  
+  
+// zxr: idx of ld/st queue for vector instruction
+  val s2_idx = RegNext(RegNext(io.vpu_memory.req.bits.idx,false.B))
+  io.vpu_memory.resp.bits.idx := s2_idx
+   
+  dontTouch(io.dmem);
+
+  io.dmem.req.bits.dprv := Mux(io.vpu_memory.req.valid,csr.io.status.dprv,Mux(ex_reg_hls, csr.io.hstatus.spvp, csr.io.status.dprv))
+  io.dmem.req.bits.dv := Mux(io.vpu_memory.req.valid,csr.io.status.dv,ex_reg_hls || csr.io.status.dv)
+  
+  //vpu传过来的数据需要延迟一拍 传入dcache 
+  val s1_req_vpu_data = RegEnable(io.vpu_memory.req.bits.data,0.U,io.vpu_memory.req.valid)
+  io.dmem.s1_data.data := Mux(RegNext(io.vpu_memory.req.valid),s1_req_vpu_data,(if (fLen == 0) mem_reg_rs2 else Mux(mem_ctrl.fp, Fill((xLen max fLen) / fLen, io.fpu.store_data), mem_reg_rs2)))
+
+  val s1_req_vpu_mask = RegEnable(io.vpu_memory.req.bits.mask,0.U,io.vpu_memory.req.valid)
+  io.dmem.s1_data.mask := Mux(RegNext(io.vpu_memory.req.valid),s1_req_vpu_mask,0.U)
+  
+  
   //若是vpu出现异常的话是否添加冲刷指令?
-  io.dmem.s1_kill := killm_common || mem_ldst_xcpt || fpu_kill_mem
+  io.dmem.s1_kill := (killm_common || mem_ldst_xcpt || fpu_kill_mem) && !vinst_accessing
   io.dmem.s2_kill := false.B
   // don't let D$ go to sleep if we're probably going to use it soon
   io.dmem.keep_clock_enabled := ibuf.io.inst(0).valid && id_ctrl.mem && !csr.io.csr_stall
+
+  //zxr: R -> V
+  io.vpu_memory.resp.bits.data := io.dmem.resp.bits.data
+  io.vpu_memory.resp.bits.mask := io.dmem.resp.bits.mask
+  io.vpu_memory.resp.bits.nack := io.dmem.s2_nack
+  io.vpu_memory.resp.bits.has_data := io.dmem.resp.bits.has_data
+  io.vpu_memory.resp.valid := Mux(vinst_accessing,io.dmem.resp.valid,0.B)
+
+
+  //zxr:exception to VPU
+  io.vpu_memory.xcpt.ma := io.dmem.s2_xcpt.ma
+  io.vpu_memory.xcpt.pf := io.dmem.s2_xcpt.pf
+  io.vpu_memory.xcpt.gf := io.dmem.s2_xcpt.gf
+  io.vpu_memory.xcpt.ae := io.dmem.s2_xcpt.ae
+
 
   io.rocc.cmd.valid := wb_reg_valid && wb_ctrl.rocc && !replay_wb_common
   io.rocc.exception := wb_xcpt && csr.io.status.xs.orR
@@ -1204,167 +1348,70 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
    * @Description: verif接口
    */
   //有的信号延迟一拍的原因是区分before和after信号
-if(coreParams.useVerif){
+if(coreParams.useVerif) {
+  ver_module.io.uvm_in.adder_in := alu.io.adder_out
+  ver_module.io.uvm_in.mem_datawr_in := (if (fLen == 0) mem_reg_rs2 else Mux(mem_ctrl.fp, Fill((xLen max fLen) / fLen, io.fpu.store_data), mem_reg_rs2))
+  ver_module.io.uvm_in.mem_npc := mem_npc
+
+  ver_module.io.uvm_in.vpu_commit_vld := io.vpu_commit.commit_vld
+  ver_module.io.uvm_in.wb_ctrl := wb_ctrl
+  ver_module.io.uvm_in.wb_reg_valid := wb_valid
+  ver_module.io.uvm_in.wb_reg_pc := wb_reg_pc
+  ver_module.io.uvm_in.wb_reg_raw_inst := wb_reg_raw_inst
+  ver_module.io.uvm_in.wb_reg_inst := wb_reg_inst
+  ver_module.io.uvm_in.ver_read_withoutrestrict := rf.ver_read_withoutrestrict()
+  ver_module.io.uvm_in.wb_xcpt := wb_xcpt
+  ver_module.io.uvm_in.ver_read := rf.ver_read()
+  ver_module.io.uvm_in.fpu_ver_read := io.fpu.fpu_ver_reg.get
+  ver_module.io.uvm_in.vpu_rfdata := io.vpu_rfdata
+
+  ver_module.io.uvm_in.status := csr.io.status.asUInt
+  ver_module.io.uvm_in.mepc := csr.io.mepc.get
+  ver_module.io.uvm_in.mtval := csr.io.mtval.get
+  ver_module.io.uvm_in.mtvec := csr.io.mtvec.get
+  ver_module.io.uvm_in.mcause := csr.io.mcause.get
+  ver_module.io.uvm_in.mip := csr.io.mip.get
+  ver_module.io.uvm_in.mie := csr.io.mie.get
+  ver_module.io.uvm_in.mscratch := csr.io.mscratch.get
+  ver_module.io.uvm_in.mideleg := csr.io.mideleg.get
+  ver_module.io.uvm_in.medeleg := csr.io.medeleg.get
+  ver_module.io.uvm_in.minstret := csr.io.minstret.get
+  ver_module.io.uvm_in.sstatus := csr.io.sstatus.get.asUInt
+  ver_module.io.uvm_in.sepc := csr.io.sepc.get
+  ver_module.io.uvm_in.stval := csr.io.stval.get
+  ver_module.io.uvm_in.stvec := csr.io.stvec.get
+  ver_module.io.uvm_in.scause := csr.io.scause.get
+  ver_module.io.uvm_in.satp := csr.io.satp.get
+  ver_module.io.uvm_in.sscratch := csr.io.sscratch.get
+  ver_module.io.uvm_in.vtype := csr.io.vtype.get
+  ver_module.io.uvm_in.vcsr := csr.io.vcsr.get
+  ver_module.io.uvm_in.vl := csr.io.vl.get
+  ver_module.io.uvm_in.vstart := csr.io.vstart.get
+  ver_module.io.uvm_in.fpu_1_wen := RegNext(RegNext(RegNext(io.fpu.fpu_1_wen.get)))
+
+  ver_module.io.uvm_in.wb_set_sboard := wb_set_sboard
+  ver_module.io.uvm_in.wb_wen := wb_wen
+  ver_module.io.uvm_in.sboard_waddr := sboard_waddr
+  ver_module.io.uvm_in.id_set_sboard := 1.B
+  ver_module.io.uvm_in.id_wen := id_vector_wxd
+  ver_module.io.uvm_in.ibuf_pc := ibuf.io.pc
+  ver_module.io.uvm_in.wb_dcache_miss := wb_dcache_miss
+  ver_module.io.uvm_in.fpu_sboard_set := io.fpu.sboard_set
+  ver_module.io.uvm_in.wb_valid := wb_valid
+  ver_module.io.uvm_in.wb_waddr := wb_waddr
+
+  ver_module.io.uvm_in.ll_wen := ll_wen
+  ver_module.io.uvm_in.ll_waddr := ll_waddr
+  ver_module.io.uvm_in.dmem_resp_replay := dmem_resp_replay
+  ver_module.io.uvm_in.dmem_resp_fpu := dmem_resp_fpu
+  ver_module.io.uvm_in.dmem_resp_waddr := dmem_resp_waddr
+  ver_module.io.uvm_in.fpu_sboard_clr := io.fpu.sboard_clr
+  ver_module.io.uvm_in.wb_waddr := wb_waddr
+  ver_module.io.uvm_in.fpu_sboard_clra := io.fpu.sboard_clra
+  ver_module.io.uvm_in.fpu_ld := io.fpu.dmem_resp_val
+
   dontTouch(io.verif.get)
-  io.verif.get.commit_valid := RegEnable(wb_reg_valid,0.U,coreParams.useVerif.B)
-  io.verif.get.commit_prevPc := RegEnable(wb_reg_pc,0.U,coreParams.useVerif.B)
-  io.verif.get.commit_currPc := RegEnable(wb_npc.get,0.U,coreParams.useVerif.B)
-  val reg_commit_order = RegInit(0.U((NRET*10).W))
-//  when(wb_reg_valid&(coreParams.useVerif.B)){
-//      reg_commit_order := reg_commit_order + 1.U
-//  }
-//  io.verif.get.commit_order := reg_commit_order
-  io.verif.get.commit_order := 0.U
-  io.verif.get.commit_insn := RegEnable(wb_reg_inst,0.U,coreParams.useVerif.B)
-  io.verif.get.commit_fused := 0.U
-
-  io.verif.get.sim_halt := 0.U
-
-  io.verif.get.trap_valid := RegEnable(wb_xcpt,0.U,coreParams.useVerif.B)
-//  io.verif.get.trap_pc := RegEnable(wb_reg_pc,0.U,coreParams.useVerif.B)
-  io.verif.get.trap_pc := 0.U
-//  io.verif.get.trap_firstInsn := RegEnable(csr.io.evec,0.U,coreParams.useVerif.B)
-  io.verif.get.trap_firstInsn := 0.U
-
-
-//因为延迟了一个周期所以寄存器中的值是after commit
-  io.verif.get.reg_gpr := rf.ver_read()
-//fpu寄存器的值通过fpu io接口引出
-  io.verif.get.reg_fpr := io.fpu.fpu_ver_reg.get
-//verif_reg_vpr
-
-  //TODO: open later now set to 0
-/*
-  io.verif.get.dest_gprWr := RegEnable(wb_ctrl.wxd,0.U,coreParams.useVerif.B)
-  io.verif.get.dest_fprWr := RegEnable(wb_ctrl.wfd,0.U,coreParams.useVerif.B)
-//verif_dest_vprWr
-  io.verif.get.dest_idx := RegEnable(wb_waddr,0.U,coreParams.useVerif.B)
-//verif_src_vmaskRd
-  io.verif.get.src1_gprRd := RegEnable(wb_ctrl.rxs1,0.U,coreParams.useVerif.B)
-  io.verif.get.src1_fprRd := RegEnable(wb_ctrl.rfs1,0.U,coreParams.useVerif.B)
-//verif_src1_vprRd
-  io.verif.get.src1_idx := RegEnable(wb_raddr1,0.U,coreParams.useVerif.B)//是直接向后引还是取再次译码的值 有时间的话再引
-  io.verif.get.src2_gprRd := RegEnable(wb_ctrl.rxs2,0.U,coreParams.useVerif.B)
-  io.verif.get.src2_fprRd := RegEnable(wb_ctrl.rfs2,0.U,coreParams.useVerif.B)
-//verif_src2_vprRd
-  io.verif.get.src2_idx :=  RegEnable(wb_reg_inst(24,20),0.U,coreParams.useVerif.B)
-  io.verif.get.src3_gprRd := false.B
-  io.verif.get.src3_fprRd := false.B
-//verif_src3_vprRd
-//verif_src3_idx
-*/
-  io.verif.get.dest_gprWr := 0.U
-  io.verif.get.dest_fprWr := 0.U
-  io.verif.get.dest_vprWr := 0.U
-  io.verif.get.dest_idx := 0.U
-  io.verif.get.src_vmaskRd :=0.U
-  io.verif.get.src1_gprRd := 0.U
-  io.verif.get.src1_fprRd := 0.U
-  io.verif.get.src1_vprRd := 0.U
-  io.verif.get.src1_idx := 0.U
-  io.verif.get.src2_gprRd := 0.U
-  io.verif.get.src2_fprRd := 0.U
-  io.verif.get.src2_vprRd := 0.U
-  io.verif.get.src2_idx := 0.U
-  io.verif.get.src3_gprRd := 0.U
-  io.verif.get.src3_fprRd := 0.U
-  io.verif.get.src3_vprRd := 0.U
-  io.verif.get.src3_idx := 0.U
-
-  io.verif.get.csr_mstatusWr := csr.io.status.asUInt
-  io.verif.get.csr_mepcWr := csr.io.mepc.get 
-  io.verif.get.csr_mtvalWr := csr.io.mtval.get
-  io.verif.get.csr_mtvecWr := csr.io.mtvec.get
-  io.verif.get.csr_mcauseWr := csr.io.mcause.get
-  io.verif.get.csr_mipWr := csr.io.mip.get
-  io.verif.get.csr_mieWr := csr.io.mie.get
-  io.verif.get.csr_mscratchWr := csr.io.mscratch.get
-  io.verif.get.csr_midelegWr := csr.io.mideleg.get
-  io.verif.get.csr_medelegWr := csr.io.medeleg.get
-  io.verif.get.csr_minstretWr := csr.io.minstret.get
-  io.verif.get.csr_sstatusWr := csr.io.sstatus.get.asUInt
-  io.verif.get.csr_sepcWr := csr.io.sepc.get
-  io.verif.get.csr_stvalWr := csr.io.stval.get
-  io.verif.get.csr_stvecWr := csr.io.stvec.get
-  io.verif.get.csr_scauseWr := csr.io.scause.get
-  io.verif.get.csr_satpWr := csr.io.satp.get
-  io.verif.get.csr_sscratchWr := csr.io.sscratch.get
-  io.verif.get.csr_vtypeWr := csr.io.vtype.get
-  io.verif.get.csr_vcsrWr := csr.io.vcsr.get
-  io.verif.get.csr_vlWr := csr.io.vl.get
-  io.verif.get.csr_vstartWr := csr.io.vstart.get
-
-  //TODO: open later now set to 0
-  /*
-    io.verif.get.csr_mstatusRd := RegEnable(csr.io.status.asUInt,0.U,coreParams.useVerif.B)
-    io.verif.get.csr_mepcRd := RegEnable(csr.io.mepc.get ,0.U,coreParams.useVerif.B)
-    io.verif.get.csr_mtvalRd := RegEnable(csr.io.mtval.get,0.U,coreParams.useVerif.B)
-    io.verif.get.csr_mtvecRd := RegEnable(csr.io.mtvec.get,0.U,coreParams.useVerif.B)
-    io.verif.get.csr_mcauseRd := RegEnable(csr.io.mcause.get,0.U,coreParams.useVerif.B)
-    io.verif.get.csr_mipRd := RegEnable(csr.io.mip.get,0.U,coreParams.useVerif.B)
-    io.verif.get.csr_mieRd := RegEnable(csr.io.mie.get,0.U,coreParams.useVerif.B)
-    io.verif.get.csr_mscratchRd := RegEnable(csr.io.mscratch.get,0.U,coreParams.useVerif.B)
-    io.verif.get.csr_midelegRd := RegEnable(csr.io.mideleg.get,0.U,coreParams.useVerif.B)
-    io.verif.get.csr_medelegRd := RegEnable(csr.io.medeleg.get,0.U,coreParams.useVerif.B)
-    io.verif.get.csr_minstretRd := RegEnable(csr.io.minstret.get,0.U,coreParams.useVerif.B)
-    io.verif.get.csr_sstatusRd := RegEnable(csr.io.sstatus.get.asUInt,0.U,coreParams.useVerif.B)
-    io.verif.get.csr_sepcRd := RegEnable(csr.io.sepc.get,0.U,coreParams.useVerif.B)
-    io.verif.get.csr_stvalRd := RegEnable(csr.io.stval.get,0.U,coreParams.useVerif.B)
-    io.verif.get.csr_stvecRd := RegEnable(csr.io.stvec.get,0.U,coreParams.useVerif.B)
-    io.verif.get.csr_scauseRd := RegEnable(csr.io.scause.get,0.U,coreParams.useVerif.B)
-    io.verif.get.csr_satpRd := RegEnable(csr.io.satp.get,0.U,coreParams.useVerif.B)
-    io.verif.get.csr_sscratchRd := RegEnable(csr.io.sscratch.get,0.U,coreParams.useVerif.B)
-    io.verif.get.csr_vtypeRd := RegEnable(csr.io.vtype.get,0.U,coreParams.useVerif.B)
-    io.verif.get.csr_vcsrRd := RegEnable(csr.io.vcsr.get,0.U,coreParams.useVerif.B)
-    io.verif.get.csr_vlRd := RegEnable(csr.io.vl.get,0.U,coreParams.useVerif.B)
-    io.verif.get.csr_vstartRd := RegEnable(csr.io.vstart.get,0.U,coreParams.useVerif.B)
-  */
-  io.verif.get.csr_mstatusRd := 0.U
-  io.verif.get.csr_mepcRd := 0.U
-  io.verif.get.csr_mtvalRd := 0.U
-  io.verif.get.csr_mtvecRd := 0.U
-  io.verif.get.csr_mcauseRd := 0.U
-  io.verif.get.csr_mipRd := 0.U
-  io.verif.get.csr_mieRd := 0.U
-  io.verif.get.csr_mscratchRd := 0.U
-  io.verif.get.csr_midelegRd := 0.U
-  io.verif.get.csr_medelegRd := 0.U
-  io.verif.get.csr_minstretRd := 0.U
-  io.verif.get.csr_sstatusRd := 0.U
-  io.verif.get.csr_sepcRd := 0.U
-  io.verif.get.csr_stvalRd := 0.U
-  io.verif.get.csr_stvecRd := 0.U
-  io.verif.get.csr_scauseRd := 0.U
-  io.verif.get.csr_satpRd := 0.U
-  io.verif.get.csr_sscratchRd := 0.U
-  io.verif.get.csr_vtypeRd := 0.U
-  io.verif.get.csr_vcsrRd := 0.U
-  io.verif.get.csr_vlRd := 0.U
-  io.verif.get.csr_vstartRd := 0.U
-
-  //TODO: open later now set to 0
-/*
-  io.verif.get.mem_valid := RegEnable(((wb_ctrl.mem_cmd === M_XRD)||(wb_ctrl.mem_cmd === M_XWR))&(wb_valid),0.U,coreParams.useVerif.B) //TODO:vector在这需要进行判断加一个或条件
-  io.verif.get.mem_addr := RegEnable(wb_reg_verif_mem_addr.get,0.U,coreParams.useVerif.B) 
-  io.verif.get.mem_isStore := RegEnable((wb_ctrl.mem_cmd === M_XRD),0.U,coreParams.useVerif.B)
-  io.verif.get.mem_isLoad  := RegEnable((wb_ctrl.mem_cmd === M_XWR),0.U,coreParams.useVerif.B)  
-  io.verif.get.mem_isVector := RegEnable((wb_ctrl.vector===true.B),0.U,coreParams.useVerif.B)
-  val delay_wb_reg_mem_size = RegEnable(1.U<<(1.U<<wb_reg_mem_size)-1.U,0.U,coreParams.useVerif.B)
-  io.verif.get.mem_maskWr := delay_wb_reg_mem_size
-  io.verif.get.mem_maskRd := delay_wb_reg_mem_size 
-  io.verif.get.mem_dataWr := RegEnable(wb_reg_verif_mem_datawr.get,0.U,coreParams.useVerif.B) 
-  io.verif.get.mem_datatRd := RegEnable(io.dmem.resp.bits.data(xLen-1, 0),0.U,coreParams.useVerif.B)
-  */
-  io.verif.get.mem_valid := 0.U
-  io.verif.get.mem_addr := 0.U
-  io.verif.get.mem_isStore := 0.U
-  io.verif.get.mem_isLoad := 0.U
-  io.verif.get.mem_isVector := 0.U
-  io.verif.get.mem_maskWr := 0.U
-  io.verif.get.mem_maskRd := 0.U
-  io.verif.get.mem_dataWr := 0.U
-  io.verif.get.mem_datatRd := 0.U
-
+  io.verif.get <> ver_module.io.uvm_out
 }
 
   if (rocketParams.clockGate) {
@@ -1444,15 +1491,6 @@ if(coreParams.useVerif){
          Mux(wb_ctrl.rxs2 || wb_ctrl.rfs2, coreMonitorBundle.rd1src, 0.U),
          Mux(wb_ctrl.rxs2 || wb_ctrl.rfs2, coreMonitorBundle.rd1val, 0.U),
          coreMonitorBundle.inst, coreMonitorBundle.inst)
-
-        /**
-         * @Editors: wuzewei
-         * @Description: add vtrace
-         */
-        if(openvtrace){
-        when(wb_valid){
-          printf(p"finish signal:vtype:${csr.io.vector.get.vconfig.vtype.asUInt}, vl:${csr.io.vector.get.vconfig.vl} \n") 
-        }}
     }
   }
 
@@ -1526,6 +1564,43 @@ if(coreParams.useVerif){
   }
 }
 
+class SaveVpuMessage extends Bundle{
+  val s_v_pc = UInt(40.W)
+}
+class VpuMessageQueue extends Module {
+    val io = IO(new Bundle {
+      val in = Flipped(Decoupled(new SaveVpuMessage))
+      val out = Decoupled(new SaveVpuMessage)
+      val cnt = Output(UInt(4.W))
+    })
+    val q = Module(new Queue(new SaveVpuMessage,entries = 12))
+    q.io.enq <> io.in
+    io.out <> q.io.deq
+    io.cnt <> q.io.count
+  }
+//zxr
+class vectorInstInfo extends Bundle{
+  val v_inst = UInt(32.W)
+  val v_rs1 = UInt(64.W)
+  val v_rs2 = UInt(64.W)
+  val v_fp_rs1 = UInt(64.W)
+}
+
+class InsructionQueue(depth:Int) extends Module{
+  val io = IO(new Bundle{
+    val enqueueInfo = Flipped(Decoupled(new vectorInstInfo)) 
+    val dequeueInfo = Decoupled(new vectorInstInfo)
+    val cnt = Output(UInt(4.W))
+  })
+
+ val queue = Module(new Queue(new vectorInstInfo, entries = depth))
+
+  queue.io.enq <> io.enqueueInfo
+  io.dequeueInfo <> queue.io.deq
+  io.cnt <> queue.io.count
+}
+ 
+
 class RegFile(n: Int, w: Int, zero: Boolean = false) {
   val rf = Mem(n, UInt(w.W))
   private def access(addr: UInt) = rf(~addr(log2Up(n)-1,0))
@@ -1550,12 +1625,14 @@ class RegFile(n: Int, w: Int, zero: Boolean = false) {
    * @Description: work for verification
    */
   def ver_read() = {
-     val memoryValues = Wire(Vec(n,UInt(w.W)))
-     memoryValues(0):=0.U
-     for(i<- 1 until n){
-      memoryValues(i):= access(i.U)  
+     val memoryValues = Wire(Vec((31),UInt(w.W)))
+     for(i<- 0 until (31)){
+      memoryValues(i):= access((i+1).U)
     }
     Cat(memoryValues.reverse)
+  }
+  def ver_read_withoutrestrict():UInt={
+    access(10.U)
   }
 }
 

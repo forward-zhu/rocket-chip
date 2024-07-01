@@ -205,11 +205,18 @@ class FPUCoreIO(implicit p: Parameters) extends CoreBundle()(p) {
   val sboard_clra = Output(UInt(5.W))
 
   val keep_clock_enabled = Input(Bool())
+
+
+  //zxr:
+  val fp_rs1 = Output(Bits())
+  val id_ctrl_vector = Input(Bool())
   /**
  * @Editors: wuzewei
  * @Description: add for verification
  */
   val fpu_ver_reg = coreParams.useVerif.option(Output(UInt((NRET*32*fLen).W)))
+  //wzw:add for sfma
+  val fpu_1_wen = coreParams.useVerif.option(Output(UInt((NRET).W)))
 }
 
 class FPUIO(implicit p: Parameters) extends FPUCoreIO ()(p) {
@@ -802,12 +809,13 @@ class FPU(cfg: FPUParams)(implicit p: Parameters) extends FPUModule()(p) {
    * @Description: add for verification
    */
   if(coreParams.useVerif){
-  val memoryValues = Wire(Vec(32,UInt((fLen+1).W)))
+  val memoryValues = Wire(Vec(32,UInt((fLen).W)))
   for(i<-0 until 32){
-    memoryValues(i):= regfile(i)
+    memoryValues(i):= ieee(regfile(i))(fLen-1,0)
   }
-  io.fpu_ver_reg.get := Cat(memoryValues)
+  io.fpu_ver_reg.get := Cat(memoryValues.reverse)
 }
+
   when (load_wb) {
     val wdata = recode(load_wb_data, load_wb_typeTag)
     regfile(load_wb_tag) := wdata
@@ -833,7 +841,12 @@ class FPU(cfg: FPUParams)(implicit p: Parameters) extends FPUModule()(p) {
       when (!id_ctrl.swap12 && !id_ctrl.swap23) { ex_ra(1) := io.inst(24,20) }
     }
     when (id_ctrl.ren3) { ex_ra(2) := io.inst(31,27) }
+    when (io.id_ctrl_vector){ex_ra(0) := io.inst(19,15)}
   }
+  //zxr:
+  //wzw: 由于浮点不是用ieee存储，所以传送时需要更改成ieee格式
+     io.fp_rs1 := ieee(ex_rs(0))
+  
   val ex_rm = Mux(ex_reg_inst(14,12) === 7.U, io.fcsr_rm, ex_reg_inst(14,12))
 
   def fuInput(minT: Option[FType]): FPInput = {
@@ -926,8 +939,10 @@ class FPU(cfg: FPUParams)(implicit p: Parameters) extends FPUModule()(p) {
   val mem_wen = mem_reg_valid && (mem_ctrl.fma || mem_ctrl.fastpipe || mem_ctrl.fromint)
   val write_port_busy = RegEnable(mem_wen && (memLatencyMask & latencyMask(ex_ctrl, 1)).orR || (wen & latencyMask(ex_ctrl, 0)).orR, req_valid)
   ccover(mem_reg_valid && write_port_busy, "WB_STRUCTURAL", "structural hazard on writeback")
+  //wzw:add for sfma
+  io.fpu_1_wen.get := req_valid && ex_ctrl.fma && ex_ctrl.typeTagOut === S
 
-  for (i <- 0 until maxLatency-2) {
+    for (i <- 0 until maxLatency-2) {
     when (wen(i+1)) { wbInfo(i) := wbInfo(i+1) }
   }
   wen := wen >> 1

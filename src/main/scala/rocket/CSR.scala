@@ -333,7 +333,6 @@ object VType {
   def fromUInt(that: UInt, ignore_vill: Boolean = false)(implicit p: Parameters): VType = {
     val res = 0.U.asTypeOf(new VType)
     val in = that.asTypeOf(res)
-    //第二个和三个条件能对应上，第一个有误
     val vill = (in.max_vsew.U < in.vsew) || !in.lmul_ok || in.reserved =/= 0.U || in.vill
     //wzw添加otherwise条件 若是不符合时按照spike进行赋值
     when (!vill || ignore_vill.B) {
@@ -404,6 +403,10 @@ class CSRFile(
   reset_mstatus.mpp := PRV.M.U
   reset_mstatus.prv := PRV.M.U
   reset_mstatus.xs := (if (usingRoCC) 3.U else 0.U)
+  //wzw change here to make the difftest run
+  reset_mstatus.vs := (if(coreParams.useVector) 3.U else 0.U)
+  reset_mstatus.fs := 3.U
+  //
   val reg_mstatus = RegInit(reset_mstatus)
 
   val new_prv = WireDefault(reg_mstatus.prv)
@@ -755,6 +758,9 @@ class CSRFile(
     read_sstatus.spie := io.status.spie
     read_sstatus.sie := io.status.sie
 
+    //wzw:添加sstatus接口
+    io.sstatus.get := (read_sstatus.asUInt)(xLen - 1, 0)
+
     read_mapping += CSRs.sstatus -> (read_sstatus.asUInt)(xLen-1,0)
     read_mapping += CSRs.sip -> read_sip.asUInt
     read_mapping += CSRs.sie -> read_sie.asUInt
@@ -889,7 +895,8 @@ class CSRFile(
       (!usingSupervisor.B || reg_mstatus.prv >= PRV.S.U || read_scounteren(counter_addr)) &&
       (!usingHypervisor.B || !reg_mstatus.v || read_hcounteren(counter_addr))
     io_dec.fp_illegal := io.status.fs === 0.U || reg_mstatus.v && reg_vsstatus.fs === 0.U || !reg_misa('f'-'a')
-    io_dec.vector_illegal := io.status.vs === 0.U || reg_mstatus.v && reg_vsstatus.vs === 0.U || !reg_misa('v'-'a')
+    //zxr: add for illegal instruction exception
+    io_dec.vector_illegal := io.status.vs === 0.U || reg_mstatus.v && reg_vsstatus.vs === 0.U || !reg_misa('v'-'a') 
     io_dec.fp_csr := decodeFast(fp_csrs.keys.toList)
     io_dec.rocc_illegal := io.status.xs === 0.U || reg_mstatus.v && reg_vsstatus.xs === 0.U || !reg_misa('x'-'a')
     val csr_addr_legal = reg_mstatus.prv >= CSR.mode(addr) ||
@@ -996,7 +1003,7 @@ class CSRFile(
    * @Description: add for verification
    */
   if(coreParams.useVerif){
-  io.mepc.get := formEPC(wdata)
+  io.mepc.get := readEPC(reg_mepc).sextTo(xLen)
   io.mtval.get := reg_mtval.sextTo(xLen)
   io.mtvec.get := read_mtvec
   io.mcause.get := reg_mcause
