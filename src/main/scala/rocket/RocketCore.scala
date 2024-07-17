@@ -405,7 +405,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     !ibuf.io.inst(0).bits.rvc && (id_system_insn && csr.io.decode(0).system_illegal) ||
     id_illegal_rnum ||
     vfp_illegal_inst || 
-    id_ctrl.vector && csr.io.decode(0).vector_illegal
+    (id_ctrl.vector || id_ctrl.vset)  && csr.io.decode(0).vector_illegal 
 //    ||
 //    id_ctrl.vector && csr.io.vector.get.vstart =/= 0.U
   val id_virtual_insn = id_ctrl.legal &&
@@ -432,11 +432,14 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   bpu.io.ea := mem_reg_wdata
   bpu.io.mcontext := csr.io.mcontext
   bpu.io.scontext := csr.io.scontext
+  
+  val interrupt_pending = RegInit(false.B)
+  val interrupt_cause_pending = Reg(UInt())
 
   val id_xcpt0 = ibuf.io.inst(0).bits.xcpt0
   val id_xcpt1 = ibuf.io.inst(0).bits.xcpt1
   val (id_xcpt, id_cause) = checkExceptions(List(
-    (csr.io.interrupt, csr.io.interrupt_cause),
+    (interrupt_pending, interrupt_cause_pending),
     (bpu.io.debug_if,  CSR.debugTriggerCause.U),
     (bpu.io.xcpt_if,   Causes.breakpoint.U),
     (id_xcpt0.pf.inst, Causes.fetch_page_fault.U),
@@ -563,7 +566,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   ex_reg_valid := !ctrl_killd
   ex_reg_replay := !take_pc && ibuf.io.inst(0).valid && ibuf.io.inst(0).bits.replay
   ex_reg_xcpt := !ctrl_killd && id_xcpt
-  ex_reg_xcpt_interrupt := !take_pc && ibuf.io.inst(0).valid && csr.io.interrupt
+  ex_reg_xcpt_interrupt := !take_pc && ibuf.io.inst(0).valid && interrupt_pending //csr.io.interrupt
 
    //zxr:
    //wzw:fix here because fpu and core are in same cycle,so ex_reg_hls is wire type
@@ -628,7 +631,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
       ex_reg_rs_msb(0) := inst >> log2Ceil(bypass_sources.size)
     }
   }
-  when (!ctrl_killd || csr.io.interrupt || ibuf.io.inst(0).bits.replay) {
+  when (!ctrl_killd || interrupt_pending || ibuf.io.inst(0).bits.replay) {  //csr.io.interrupt
     ex_reg_cause := id_cause
     ex_reg_inst := id_inst(0)
     ex_reg_raw_inst := id_raw_inst(0)
@@ -923,20 +926,20 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   vset_issue_vconfig.vl := VType.computeVL(wb_avl,zimm,csr.io.vector.get.vconfig.vl,wb_usecurrent,wb_usemax,wb_usezero)
   csr.io.vector.foreach { vio =>
     vio.set_vconfig.bits := Mux((wb_valid & wb_ctrl.vset),vset_issue_vconfig,vpu_issue_vconfig)
-    vio.set_vconfig.valid := (wb_valid & wb_ctrl.vset) | (io.vpu_commit.commit_vld & io.vpu_commit.update_vl)
+    vio.set_vconfig.valid := ((wb_valid & wb_ctrl.vset) | (io.vpu_commit.commit_vld & io.vpu_commit.update_vl) ) && (!wb_xcpt)
     //wzw:change for updating vstart All vector instructions, including vset{i}vl{i}, reset the vstart CSR to zero
-    vio.set_vstart.valid := ((io.vpu_commit.commit_vld)&(update_vstart))|(wb_valid & wb_ctrl.vset)
+    vio.set_vstart.valid := (((io.vpu_commit.commit_vld)&(update_vstart))|(wb_valid & wb_ctrl.vset))&(!wb_xcpt)
     vio.set_vstart.bits := Mux((wb_valid & wb_ctrl.vset),0.U,update_vstart_data)
     vio.set_vxsat := io.vpu_commit.vxsat
-    vio.set_vs_dirty := (wb_valid &(wb_ctrl.vset|wb_ctrl.vector))
-    //vio.set_vs_dirty := false.asBool
+    vio.set_vs_dirty := (wb_valid &(wb_ctrl.vset|wb_ctrl.vector)) &&(!wb_xcpt)
+    // vio.set_vs_dirty := false.asBool
     }
 
 
 //zxr: issue queue
 val vectorQueue = Module(new InsructionQueue(12))
-
-vectorQueue.io.enqueueInfo.valid := wb_reg_valid && wb_ctrl.vector && !(wb_xcpt);
+vectorQueue.io.flush := vpu_lsu_xcpt || io.vpu_commit.commit_vld&&io.vpu_commit.illegal_inst
+vectorQueue.io.enqueueInfo.valid := wb_reg_valid && wb_ctrl.vector && !(wb_xcpt);  
 vectorQueue.io.enqueueInfo.bits.v_rs1 := wb_reg_rs1
 vectorQueue.io.enqueueInfo.bits.v_rs2 := wb_reg_rs2
 vectorQueue.io.enqueueInfo.bits.v_fp_rs1 := wb_reg_fp_rs1
@@ -1029,6 +1032,18 @@ vectorQueue.io.dequeueInfo.ready := io.vpu_issue.ready
   //zxr: change retire signal for vpu
   csr.io.retire := !wb_ctrl.vector && wb_valid ||  io.vpu_commit.commit_vld && !io.vpu_commit.exception_vld
   csr.io.inst(0) := (if (usingCompressed) Cat(Mux(wb_reg_raw_inst(1, 0).andR, wb_reg_inst >> 16, 0.U), wb_reg_raw_inst(15, 0)) else wb_reg_inst)
+   //wzw 如果发送到队列中则认为指令已经发出去了
+  val table = RegInit(0.U(4.W))
+  when(vectorQueue.io.enqueueInfo.valid&io.vpu_commit.commit_vld){
+    table := table;
+  }.elsewhen(vectorQueue.io.enqueueInfo.valid) {table := table + 1.U}
+  .elsewhen(io.vpu_commit.commit_vld) {table := table - 1.U}
+  when (vpu_lsu_xcpt || io.vpu_commit.commit_vld&&io.vpu_commit.illegal_inst){table := 0.U}
+  //if vpu busy, satll rocket，jyf
+  //not ready，要stall住标量和向量的发送，故ctrl_stalld置1，并导致ctrl_killd置1
+  //isvectorrun,有向量指令在执行，但如果下一条仍是向量且ready仍能发
+  val isvectorrun = ((table===0.U) && io.vpu_issue.fire)||(table =/= 0.U)
+  
   csr.io.interrupts := io.interrupts
   csr.io.hartid := io.hartid
   io.fpu.fcsr_rm := csr.io.fcsr_rm
@@ -1170,21 +1185,18 @@ vectorQueue.io.dequeueInfo.ready := io.vpu_issue.ready
   val rocc_blocked = Reg(Bool())
   rocc_blocked := !wb_xcpt && !io.rocc.cmd.ready && (io.rocc.cmd.valid || rocc_blocked)
 
-  //if vpu busy, satll rocket，jyf
-  //not ready，要stall住标量和向量的发送，故ctrl_stalld置1，并导致ctrl_killd置1
-  //isvectorrun,有向量指令在执行，但如果下一条仍是向量且ready仍能发
-  //wzw 如果发送到队列中则认为指令已经发出去了
-  val table = RegInit(0.U(4.W))
-  when(vectorQueue.io.enqueueInfo.valid&io.vpu_commit.commit_vld){
-    table := table;
-  }.elsewhen(vectorQueue.io.enqueueInfo.valid) {table := table + 1.U}
-  .elsewhen(io.vpu_commit.commit_vld) {table := table - 1.U}
-  val isvectorrun = ((table===0.U) && io.vpu_issue.fire)||(table =/= 0.U)
-
   //zxr: check if there are any vector instructions in the pipeline
   //**
   val vector_in_pipe = (ex_reg_valid && ex_ctrl.vector) || (mem_reg_valid && mem_ctrl.vector) ||(wb_reg_valid && wb_ctrl.vector)
   //**
+  
+  when(csr.io.interrupt && !isvectorrun && !vector_in_pipe && !wb_xcpt ){
+    interrupt_pending := true.B
+    interrupt_cause_pending := csr.io.interrupt_cause
+  }.otherwise{
+    interrupt_pending := false.B
+    interrupt_cause_pending := DontCare
+  }
 
   val ctrl_stalld = {
     id_ex_hazard || id_mem_hazard || id_wb_hazard || id_sboard_hazard ||
@@ -1206,9 +1218,11 @@ vectorQueue.io.dequeueInfo.ready := io.vpu_issue.ready
     id_do_fence ||
     csr.io.csr_stall ||
     id_reg_pause ||
-    io.traceStall
+    io.traceStall ||
+    vectorQueue.isFull ||
+    (csr.io.interrupt && !interrupt_pending && !wb_xcpt)
   }
-    ctrl_killd := !ibuf.io.inst(0).valid || ibuf.io.inst(0).bits.replay || take_pc_mem_wb || ctrl_stalld || csr.io.interrupt
+    ctrl_killd := !ibuf.io.inst(0).valid || ibuf.io.inst(0).bits.replay || take_pc_mem_wb || ctrl_stalld || interrupt_pending 
 
   io.imem.req.valid := take_pc
   io.imem.req.bits.speculative := !take_pc_wb
@@ -1591,15 +1605,16 @@ class InsructionQueue(depth:Int) extends Module{
     val enqueueInfo = Flipped(Decoupled(new vectorInstInfo)) 
     val dequeueInfo = Decoupled(new vectorInstInfo)
     val cnt = Output(UInt(4.W))
+    val flush = Input(Bool())
   })
 
- val queue = Module(new Queue(new vectorInstInfo, entries = depth))
-
+ val queue = Module(new Queue(new vectorInstInfo, entries = depth,hasFlush = true))
+ def isFull = io.cnt >= depth.U - 3.U
   queue.io.enq <> io.enqueueInfo
   io.dequeueInfo <> queue.io.deq
   io.cnt <> queue.io.count
+  queue.io.flush.getOrElse(false.B) := io.flush
 }
- 
 
 class RegFile(n: Int, w: Int, zero: Boolean = false) {
   val rf = Mem(n, UInt(w.W))
