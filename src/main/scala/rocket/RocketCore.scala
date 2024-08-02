@@ -1424,6 +1424,9 @@ if(coreParams.useVerif) {
   ver_module.io.uvm_in.wb_waddr := wb_waddr
   ver_module.io.uvm_in.fpu_sboard_clra := io.fpu.sboard_clra
   ver_module.io.uvm_in.fpu_ld := io.fpu.dmem_resp_val
+  ver_module.io.uvm_in.evec := csr.io.evec
+  ver_module.io.uvm_in.eret := csr.io.eret
+  ver_module.io.uvm_in.flush := vpu_lsu_xcpt || io.vpu_commit.commit_vld && io.vpu_commit.illegal_inst
 
   dontTouch(io.verif.get)
   io.verif.get <> ver_module.io.uvm_out

@@ -105,6 +105,8 @@ class VEROUTIO(implicit p: Parameters) extends CoreBundle()(p) {
   val  update_reg_data = Output(UInt((NRET*xLen).W))
   //add for sfma
   val  sfma = Output(UInt((NRET).W))
+  //add for exception or RET inst
+  val csr_evec = Output(UInt((NRET*xLen).W))
 
 }
 class VERINIO(implicit p: Parameters) extends CoreBundle()(p){
@@ -173,6 +175,10 @@ class VERINIO(implicit p: Parameters) extends CoreBundle()(p){
   val fpu_sboard_clra = Input(UInt())
   //wzw: add for fpu ld
   val fpu_ld = Input(UInt())
+  //zxr:add for excption and RET inst
+  val evec = Input(UInt())
+  val eret = Input(Bool())
+  val flush = Input(Bool())
 }
 
 class UvmQueueSignal (implicit p: Parameters) extends CoreBundle()(p) {
@@ -203,11 +209,13 @@ class UvmVerification(implicit p:Parameters) extends CoreModule{
       val in = Flipped(Decoupled(new UvmQueueSignal))
       val out = Decoupled(new UvmQueueSignal)
       val cnt = Output(UInt(4.W))
+      val flush = Input(Bool())
     })
-    val q = Module(new Queue(new UvmQueueSignal,entries = 20))
+    val q = Module(new Queue(new UvmQueueSignal,entries = 20,hasFlush = true))
     q.io.enq <> io.in
     io.out <> q.io.deq
     io.cnt <> q.io.count
+    q.io.flush.getOrElse(false.B) := io.flush
   }
   val wb_insn ={if (usingCompressed) Cat(Mux(io.uvm_in.wb_reg_raw_inst(1, 0).andR, (io.uvm_in.wb_reg_inst) >> 16, 0.U), io.uvm_in.wb_reg_raw_inst(15, 0)) else io.uvm_in.wb_reg_inst}
   // add to store necessary vpu signal
@@ -218,14 +226,19 @@ class UvmVerification(implicit p:Parameters) extends CoreModule{
   q.io.in.bits.minstret := (io.uvm_in.minstret)
   q.io.in.valid := RegNext(io.uvm_in.wb_reg_valid & io.uvm_in.wb_ctrl.vector)
   q.io.out.ready := io.uvm_in.vpu_commit_vld
+  q.io.flush := io.uvm_in.flush
   //
   //记录上一条指令的insn 供异常处理时使用
   val trap_valid = RegEnable(io.uvm_in.wb_xcpt, 0.U, coreParams.useVerif.B)
+  // RET指令
+  val trap_RET = RegEnable(io.uvm_in.eret, 0.U, coreParams.useVerif.B)
+  val eret_addr = RegEnable(io.uvm_out.csr_evec, 0.U, coreParams.useVerif.B)
   val commit_insn_r = RegEnable(io.uvm_out.commit_insn,0.U,io.uvm_out.commit_valid.asBool);
   io.uvm_out.commit_start := RegEnable(1.B, 0.B, coreParams.useVerif.B&(io.uvm_in.wb_reg_valid)&(io.uvm_out.commit_prevPc === "h8000_0000".U))
   io.uvm_out.commit_valid := RegEnable(((io.uvm_in.wb_reg_valid)&(~io.uvm_in.wb_ctrl.vector))||((io.uvm_in.wb_xcpt(0).asBool))||io.uvm_in.vpu_commit_vld , 0.U, coreParams.useVerif.B)
   io.uvm_out.commit_prevPc := RegEnable(Mux(q.io.out.fire,q.io.out.bits.prePc,io.uvm_in.wb_reg_pc), 0.U, coreParams.useVerif.B)
-  io.uvm_out.commit_currPc := Mux((io.uvm_out.commit_insn === (0x30200073.U)),io.uvm_out.csr_mepcWr,Mux(trap_valid(0).asBool,io.uvm_out.csr_mtvecWr,RegEnable(Mux(q.io.out.fire,q.io.out.bits.currPc,wb_npc), 0.U, coreParams.useVerif.B)))
+  //io.uvm_out.commit_currPc := Mux((io.uvm_out.commit_insn === (0x30200073.U)),eret_addr,Mux(trap_valid(0).asBool,eret_addr,RegEnable(Mux(q.io.out.fire,q.io.out.bits.currPc,wb_npc), 0.U, coreParams.useVerif.B)))
+  io.uvm_out.commit_currPc := Mux(trap_RET(0).asBool,eret_addr,Mux(trap_valid(0).asBool,io.uvm_out.csr_mtvecWr,RegEnable(Mux(q.io.out.fire,q.io.out.bits.currPc,wb_npc), 0.U, coreParams.useVerif.B)))
   io.uvm_out.csr_minstretWr := io.uvm_in.minstret
   io.uvm_out.commit_order := 0.U
   io.uvm_out.commit_insn := Mux(trap_valid(0).asBool,commit_insn_r,RegEnable(Mux(q.io.out.fire,q.io.out.bits.insn,wb_insn), 0.U, coreParams.useVerif.B))
@@ -323,6 +336,7 @@ class UvmVerification(implicit p:Parameters) extends CoreModule{
   //io.uvm_out.csr_vstartWr := 0.U
   //wzw: add for sfma
   io.uvm_out.sfma := RegNext(RegNext(RegNext(io.uvm_in.fpu_1_wen))) | RegNext(io.uvm_in.fpu_ld)
+  io.uvm_out.csr_evec := io.uvm_in.evec
 
   //TODO: open later now set to 0
   /*
