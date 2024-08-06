@@ -1427,6 +1427,7 @@ if(coreParams.useVerif) {
   ver_module.io.uvm_in.evec := csr.io.evec
   ver_module.io.uvm_in.eret := csr.io.eret
   ver_module.io.uvm_in.flush := vpu_lsu_xcpt || io.vpu_commit.commit_vld && io.vpu_commit.illegal_inst
+  ver_module.io.uvm_in.sfence := wb_reg_sfence
 
   dontTouch(io.verif.get)
   io.verif.get <> ver_module.io.uvm_out

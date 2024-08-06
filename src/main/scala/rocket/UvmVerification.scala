@@ -179,6 +179,7 @@ class VERINIO(implicit p: Parameters) extends CoreBundle()(p){
   val evec = Input(UInt())
   val eret = Input(Bool())
   val flush = Input(Bool())
+  val sfence = Input(Bool())
 }
 
 class UvmQueueSignal (implicit p: Parameters) extends CoreBundle()(p) {
@@ -230,15 +231,17 @@ class UvmVerification(implicit p:Parameters) extends CoreModule{
   //
   //记录上一条指令的insn 供异常处理时使用
   val trap_valid = RegEnable(io.uvm_in.wb_xcpt, 0.U, coreParams.useVerif.B)
+  val sfence = RegEnable(io.uvm_in.sfence, 0.U, coreParams.useVerif.B)
   // RET指令
   val trap_RET = RegEnable(io.uvm_in.eret, 0.U, coreParams.useVerif.B)
   val eret_addr = RegEnable(io.uvm_out.csr_evec, 0.U, coreParams.useVerif.B)
   val commit_insn_r = RegEnable(io.uvm_out.commit_insn,0.U,io.uvm_out.commit_valid.asBool);
   io.uvm_out.commit_start := RegEnable(1.B, 0.B, coreParams.useVerif.B&(io.uvm_in.wb_reg_valid)&(io.uvm_out.commit_prevPc === "h8000_0000".U))
-  io.uvm_out.commit_valid := RegEnable(((io.uvm_in.wb_reg_valid)&(~io.uvm_in.wb_ctrl.vector))||((io.uvm_in.wb_xcpt(0).asBool))||io.uvm_in.vpu_commit_vld , 0.U, coreParams.useVerif.B)
+  io.uvm_out.commit_valid := RegEnable(((io.uvm_in.wb_reg_valid)&(~io.uvm_in.wb_ctrl.vector))||io.uvm_in.vpu_commit_vld , 0.U, coreParams.useVerif.B)
+  //io.uvm_out.commit_valid := RegEnable(((io.uvm_in.wb_reg_valid)&(~io.uvm_in.wb_ctrl.vector))||((io.uvm_in.wb_xcpt(0).asBool))||io.uvm_in.vpu_commit_vld , 0.U, coreParams.useVerif.B)
   io.uvm_out.commit_prevPc := RegEnable(Mux(q.io.out.fire,q.io.out.bits.prePc,io.uvm_in.wb_reg_pc), 0.U, coreParams.useVerif.B)
   //io.uvm_out.commit_currPc := Mux((io.uvm_out.commit_insn === (0x30200073.U)),eret_addr,Mux(trap_valid(0).asBool,eret_addr,RegEnable(Mux(q.io.out.fire,q.io.out.bits.currPc,wb_npc), 0.U, coreParams.useVerif.B)))
-  io.uvm_out.commit_currPc := Mux(trap_RET(0).asBool,eret_addr,Mux(trap_valid(0).asBool,io.uvm_out.csr_mtvecWr,RegEnable(Mux(q.io.out.fire,q.io.out.bits.currPc,wb_npc), 0.U, coreParams.useVerif.B)))
+  io.uvm_out.commit_currPc := Mux(trap_RET(0).asBool,eret_addr,Mux(trap_valid(0).asBool,eret_addr,Mux(sfence(0).asBool ,wb_npc,RegEnable(Mux(q.io.out.fire,q.io.out.bits.currPc,wb_npc), 0.U, coreParams.useVerif.B))))
   io.uvm_out.csr_minstretWr := io.uvm_in.minstret
   io.uvm_out.commit_order := 0.U
   io.uvm_out.commit_insn := Mux(trap_valid(0).asBool,commit_insn_r,RegEnable(Mux(q.io.out.fire,q.io.out.bits.insn,wb_insn), 0.U, coreParams.useVerif.B))
