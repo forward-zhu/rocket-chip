@@ -1166,6 +1166,7 @@ vectorQueue.io.dequeueInfo.ready := io.vpu_issue.ready
   //wzw:add vpu_w_fpr to clear sboard
   val vpu_w_fpr=   (io.vpu_commit.commit_vld & io.vpu_commit.return_data_float_vld &(!io.vpu_commit.exception_vld))
   val vpu_w_fpr_e= (io.vpu_commit.return_data_float_vld & io.vpu_commit.exception_vld)
+  val vpu_flush_fp_sb = io.vpu_commit.commit_vld & io.vpu_commit.exception_vld
   val id_stall_fpu = if (usingFPU) {
     val fp_sboard = new Scoreboard(32)
     fp_sboard.set((wb_dcache_miss && wb_ctrl.wfd || io.fpu.sboard_set) && wb_valid || wb_vector_wfd && wb_reg_valid && (!wb_xcpt), wb_waddr)
@@ -1173,7 +1174,11 @@ vectorQueue.io.dequeueInfo.ready := io.vpu_issue.ready
     fp_sboard.clear(io.fpu.sboard_clr, io.fpu.sboard_clra)
     //wzw: fp clear sboard
     fp_sboard.clear(vpu_w_fpr.asBool||vpu_w_fpr_e.asBool,io.vpu_commit.return_reg_idx)
-
+    when(vpu_flush_fp_sb){
+      for(i <- 0 until 31){
+      fp_sboard.clear(vpu_flush_fp_sb,i.U)
+    }
+    }
     checkHazards(fp_hazard_targets, fp_sboard.read _)
   } else false.B
 
