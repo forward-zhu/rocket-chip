@@ -1036,13 +1036,17 @@ vectorQueue.io.dequeueInfo.ready := io.vpu_issue.ready
    
    //zxr: Used to monitor the operating status of the VPU
   val table = RegInit(0.U(4.W))
-  when(vectorQueue.io.enqueueInfo.fire && !io.vpu_commit.commit_vld){
-    table := table + 1.U
-  }.elsewhen(!vectorQueue.io.enqueueInfo.fire && io.vpu_commit.commit_vld){
-    table := table - 1.U
-  }.otherwise{
+  //when(vectorQueue.io.enqueueInfo.fire && !io.vpu_commit.commit_vld){
+  //  table := table + 1.U
+  //}.elsewhen(!vectorQueue.io.enqueueInfo.fire && io.vpu_commit.commit_vld){
+  //  table := table - 1.U
+  //}.otherwise{
+  //  table := table
+  //}
+  when(vectorQueue.io.enqueueInfo.fire && io.vpu_commit.commit_vld){
     table := table
-  }
+  }.elsewhen(vectorQueue.io.enqueueInfo.fire ) {table := table + 1.U}
+  .elsewhen(io.vpu_commit.commit_vld) {table := table - 1.U}
 
   //if vpu busy, satll rocket，jyf
   //not ready，要stall住标量和向量的发送，故ctrl_stalld置1，并导致ctrl_killd置1
