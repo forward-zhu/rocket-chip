@@ -1043,11 +1043,11 @@ vectorQueue.io.dequeueInfo.ready := io.vpu_issue.ready
   //}.otherwise{
   //  table := table
   //}
-  when(vectorQueue.io.enqueueInfo.fire && io.vpu_commit.commit_vld){
+  when(vectorQueue.io.enqueueInfo.valid && io.vpu_commit.commit_vld){
     table := table
-  }.elsewhen(vectorQueue.io.enqueueInfo.fire ) {table := table + 1.U}
+  }.elsewhen(vectorQueue.io.enqueueInfo.valid) {table := table + 1.U}
   .elsewhen(io.vpu_commit.commit_vld) {table := table - 1.U}
-
+  when (vpu_lsu_xcpt || io.vpu_commit.commit_vld&&io.vpu_commit.illegal_inst){table := 0.U}
   //if vpu busy, satll rocket，jyf
   //not ready，要stall住标量和向量的发送，故ctrl_stalld置1，并导致ctrl_killd置1
   //isvectorrun,有向量指令在执行，但如果下一条仍是向量且ready仍能发
