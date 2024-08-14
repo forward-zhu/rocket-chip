@@ -1035,9 +1035,9 @@ vectorQueue.io.dequeueInfo.ready := io.vpu_issue.ready
   csr.io.inst(0) := (if (usingCompressed) Cat(Mux(wb_reg_raw_inst(1, 0).andR, wb_reg_inst >> 16, 0.U), wb_reg_raw_inst(15, 0)) else wb_reg_inst)
    //wzw 如果发送到队列中则认为指令已经发出去了
   val table = RegInit(0.U(4.W))
-  when(vectorQueue.io.enqueueInfo.valid&io.vpu_commit.commit_vld){
+  when(vectorQueue.io.enqueueInfo.fire && io.vpu_commit.commit_vld){
     table := table;
-  }.elsewhen(vectorQueue.io.enqueueInfo.valid) {table := table + 1.U}
+  }.elsewhen(vectorQueue.io.enqueueInfo.fire) {table := table + 1.U}
   .elsewhen(io.vpu_commit.commit_vld) {table := table - 1.U}
   when (vpu_lsu_xcpt || io.vpu_commit.commit_vld&&io.vpu_commit.illegal_inst){table := 0.U}
   //if vpu busy, satll rocket，jyf
