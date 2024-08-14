@@ -1178,8 +1178,10 @@ vectorQueue.io.dequeueInfo.ready := io.vpu_issue.ready
     fp_sboard.clear(io.fpu.sboard_clr, io.fpu.sboard_clra)
     //wzw: fp clear sboard
     fp_sboard.clear(vpu_w_fpr.asBool||vpu_w_fpr_e.asBool,io.vpu_commit.return_reg_idx)
-      for(i <- 0 until 31){
-      fp_sboard.clear(vpu_xcpt,i.U)
+    when(vpu_flush_fp_sb){
+      for(i <- 0 to 31){
+      fp_sboard.clear(vpu_flush_fp_sb,i.U)
+    }
     }
     checkHazards(fp_hazard_targets, fp_sboard.read _)
   } else false.B
