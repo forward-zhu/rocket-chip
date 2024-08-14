@@ -1037,16 +1037,9 @@ vectorQueue.io.dequeueInfo.ready := io.vpu_issue.ready
    
    //zxr: Used to monitor the operating status of the VPU
   val table = RegInit(0.U(4.W))
-  //when(vectorQueue.io.enqueueInfo.fire && !io.vpu_commit.commit_vld){
-  //  table := table + 1.U
-  //}.elsewhen(!vectorQueue.io.enqueueInfo.fire && io.vpu_commit.commit_vld){
-  //  table := table - 1.U
-  //}.otherwise{
-  //  table := table
-  //}
   when(vectorQueue.io.enqueueInfo.fire && io.vpu_commit.commit_vld){
-    table := table
-  }.elsewhen(vectorQueue.io.enqueueInfo.fire ) {table := table + 1.U}
+    table := table;
+  }.elsewhen(vectorQueue.io.enqueueInfo.fire) {table := table + 1.U}
   .elsewhen(io.vpu_commit.commit_vld) {table := table - 1.U}
   when (vpu_xcpt){table := 0.U}
   //if vpu busy, satll rocket，jyf
