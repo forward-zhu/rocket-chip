@@ -1133,9 +1133,10 @@ vectorQueue.io.dequeueInfo.ready := io.vpu_issue.ready
 
   val sboard = new Scoreboard(32, true)
   sboard.clear(ll_wen, ll_waddr)
-    for (i <- 0 until 31) {
-        sboard.clear(vpu_xcpt, i.U)
-    }
+  //TODO: maybe need it later
+  //  for (i <- 1 to 31) {
+  //      sboard.clear(vpu_xcpt, i.U)
+  //  }
   def id_sboard_clear_bypass(r: UInt) = {
     // ll_waddr arrives late when D$ has ECC, so reshuffle the hazard check
     if (!tileParams.dcache.get.dataECC.isDefined) ll_wen && ll_waddr === r
@@ -1185,8 +1186,10 @@ vectorQueue.io.dequeueInfo.ready := io.vpu_issue.ready
     fp_sboard.clear(io.fpu.sboard_clr, io.fpu.sboard_clra)
     //wzw: fp clear sboard
     fp_sboard.clear(vpu_w_fpr.asBool||vpu_w_fpr_e.asBool,io.vpu_commit.return_reg_idx)
-      for(i <- 0 until 31){
+    when(vpu_xcpt){
+      for(i <- 0 to 31){
       fp_sboard.clear(vpu_xcpt,i.U)
+      }
     }
     checkHazards(fp_hazard_targets, fp_sboard.read _)
   } else false.B
