@@ -1019,7 +1019,7 @@ vectorQueue.io.dequeueInfo.ready := io.vpu_issue.ready
                   * @Editors: wuzewei
                   * @Description: 若是vset(i)vl(i)信号，则写回的是从csr返回的vl的值
                   */
-                 Mux(wb_ctrl.vset,vset_issue_vconfig.vl,
+                 Mux(wb_ctrl.vset && wb_reg_valid,vset_issue_vconfig.vl,
                  Mux(ll_wen, ll_wdata,
                  Mux(wb_ctrl.csr =/= CSR.N, csr.io.rw.rdata,
                  Mux(wb_ctrl.mul, mul.map(_.io.resp.bits.data).getOrElse(wb_reg_wdata),
