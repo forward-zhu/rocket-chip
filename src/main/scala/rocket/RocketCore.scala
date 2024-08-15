@@ -1124,6 +1124,9 @@ vectorQueue.io.dequeueInfo.ready := io.vpu_issue.ready
 
   val sboard = new Scoreboard(32, true)
   sboard.clear(ll_wen, ll_waddr)
+  for (i <- 0 until 31) {
+        sboard.clear(vpu_lsu_xcpt, i.U)
+    }
   def id_sboard_clear_bypass(r: UInt) = {
     // ll_waddr arrives late when D$ has ECC, so reshuffle the hazard check
     if (!tileParams.dcache.get.dataECC.isDefined) ll_wen && ll_waddr === r
